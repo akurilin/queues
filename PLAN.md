@@ -9,20 +9,20 @@ Goals
 
 To-Do Tracker
 -------------
-- [ ] Scaffold repo layout (terraform/, consumer/, producer/, scripts/, README.md stub).
-- [ ] Terraform skeleton: providers/versions, VPC (public-only), SQS + DLQ module, hand-rolled ECS cluster/service/task, ECR repo, IAM roles, CloudWatch log group, outputs (queue URL/ARN, DLQ ARN, image URI), local_file for `.env`.
-- [ ] Consumer: Dockerfile, app.py (long-poll loop, failure knobs: crash rate, long sleep to exceed visibility, optional idempotency tracking), requirements.txt.
-- [ ] Producer: produce.py (N messages, optional rate, UUID payload, CLI args for queue URL/profile).
-- [ ] Scripts: build_and_push.sh (login, build, tag, push), set_env.sh (optional helpers).
-- [ ] README: usage (3-command flow), failure-mode experiments, scaling notes.
-- [ ] Run terraform apply locally (us-east-1) and capture outputs.
+- [x] Scaffold repo layout (terraform/, consumer/, producer/, scripts/, README.md stub).
+- [x] Terraform skeleton: providers/versions, VPC (public-only), SQS + DLQ module, hand-rolled ECS cluster/service/task, ECR repo, IAM roles, CloudWatch log group, outputs (queue URL/ARN, DLQ ARN, image URI), local_file for `.env`.
+- [x] Consumer: Dockerfile, app.py (long-poll loop, failure knobs: crash rate, long sleep to exceed visibility, optional idempotency tracking), requirements.txt.
+- [x] Producer: produce.py (N messages, optional rate, UUID payload, CLI args for queue URL/profile).
+- [x] Scripts: build_and_push.sh (login, build, tag, push), set_env.sh (optional helpers).
+- [x] README: usage (3-command flow), failure-mode experiments, scaling notes.
+- [x] Run terraform apply locally (us-west-1) and capture outputs.
 - [ ] Build/push consumer image to ECR.
 - [ ] Run producer locally against the deployed queue.
 - [ ] Execute failure-mode experiments (visibility overrun, crash rate, duplicates, burst load, task kill) and note observations.
 
 Architecture
 ------------
-- AWS Region: us-east-1.
+- AWS Region: us-west-1.
 - VPC: new minimal VPC with public subnets only (no NAT) via terraform-aws-modules/vpc to keep infra minimal.
 - SQS: Standard queue + DLQ (terraform-aws-modules/sqs-queue). Default settings (visibility, retention, long polling default). Redrive to DLQ on default max receives.
 - ECS Fargate: cluster/service/task hand-rolled (no ECS module) running consumer container in public subnets without public inbound (SG egress-only; tasks can get public IP for outbound).
@@ -49,7 +49,7 @@ Repo Layout
 
 Terraform Details
 -----------------
-- Providers: aws (region us-east-1), local state (no remote backend).
+- Providers: aws (region us-west-1), local state (no remote backend).
 - VPC: small CIDR, 2 AZs, public subnets only (no NAT) to keep setup minimal.
 - SQS queue: Standard, DLQ attached, default visibility/retention/long-poll, redrive policy default, outputs for queue URL and DLQ ARN.
 - ECS Fargate (hand-rolled):
