@@ -457,6 +457,7 @@ def scenario_crash(args: argparse.Namespace, env: Dict[str, str]) -> None:
             "IDLE_TIMEOUT_SECONDS": "30",
         },
     )
+    print(f"[crash] Crash task ARN: {crash_task}")
     crash_desc = wait_for_task_stop(cluster, crash_task, timeout=args.consumer_timeout)
     crash_exit = get_container_exit_code(crash_desc, container)
     if crash_exit == 0:
