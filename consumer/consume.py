@@ -95,10 +95,14 @@ def main() -> None:
 
     # Read crash rate for chaos testing (0.0-1.0 probability, default 0 = no crashes)
     crash_rate = env_float("CRASH_RATE", 0.0)
+    # Force crash immediately after receiving a message (deterministic crash for tests)
+    crash_after_receive = bool(env_int("CRASH_AFTER_RECEIVE", 0))
     # Read size of idempotency cache (how many message IDs to remember, default 1000)
     idempotency_cache_size = env_int("IDEMPOTENCY_CACHE_SIZE", 1000)
     # Read optional message limit for testing (stop after N messages, default 0 = unlimited)
     message_limit = env_int("MESSAGE_LIMIT", 0)  # Optional stop-after-N for tests
+    # Optional idle timeout: exit if no messages arrive for this many seconds (0 = disabled)
+    idle_timeout_seconds = env_int("IDLE_TIMEOUT_SECONDS", 0)
 
     # Log startup configuration so user knows what behavior is enabled
     logger.info(
@@ -121,6 +125,8 @@ def main() -> None:
     seen_set: set[str] = set()
     # Track total messages processed (for limit checking and logging)
     processed_count = 0
+    # Track last time a message was seen (for idle timeout)
+    last_message_time = time.time()
 
     # Inner function to add a message ID to the deduplication cache
     def remember_message_id(message_id: str) -> None:
@@ -161,7 +167,15 @@ def main() -> None:
             messages = response.get("Messages", [])
             # If no messages, continue to next poll iteration
             if not messages:
+                if idle_timeout_seconds > 0 and (time.time() - last_message_time) >= idle_timeout_seconds:
+                    logger.info(
+                        "Idle timeout of %ss reached with no messages; exiting",
+                        idle_timeout_seconds,
+                    )
+                    return
                 continue
+            # Reset idle timer when messages arrive
+            last_message_time = time.time()
 
             # Process each message in the batch
             for message in messages:
@@ -180,6 +194,7 @@ def main() -> None:
                         long_sleep_seconds,
                         long_sleep_every,
                         crash_rate,
+                        crash_after_receive,
                         is_duplicate,
                         remember_message_id,
                     )
@@ -219,6 +234,7 @@ def handle_message(
     long_sleep_seconds: float,
     long_sleep_every: int,
     crash_rate: float,
+    crash_after_receive: bool,
     is_duplicate: Callable[[str], bool],
     remember_message_id: Callable[[str], None],
 ) -> None:
@@ -269,6 +285,10 @@ def handle_message(
     logger.info("Processing message id=%s payload=%s", message_id, payload)
     # Sleep to simulate work being done (processing time)
     time.sleep(sleep_time)
+
+    # Force a deterministic crash after doing the work but before delete (test hook)
+    if crash_after_receive:
+        raise CrashError("Intentional post-receive crash for testing")
 
     # Delete message from queue after successful processing (prevents redelivery)
     delete_message(sqs_client, queue_url, message)

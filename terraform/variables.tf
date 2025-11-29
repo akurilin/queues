@@ -43,7 +43,7 @@ variable "container_image_tag" {
 variable "queue_visibility_timeout" {
   description = "Visibility timeout for the SQS queue (seconds)"
   type        = number
-  default     = 30
+  default     = 10
 }
 
 variable "queue_receive_wait" {
