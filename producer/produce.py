@@ -152,6 +152,13 @@ def main() -> None:
 
         # Advance the index by the chunk size to process next batch
         message_index += chunk
+        # Report batch progress so caller can see how far along we are.
+        logging.info(
+            "Progress: sent %s/%s (failed=%s this batch)",
+            sent,
+            total,
+            batch_failed,
+        )
         # Throttle if needed to maintain the target send rate (rate limiting)
         maybe_throttle(start_time, sent, args.rate)
 

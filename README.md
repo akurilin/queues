@@ -75,8 +75,9 @@ Repo contains:
 
 ## Producer usage
 ```bash
-python producer/produce.py --n 100 --rate 20 --queue-url "$QUEUE_URL" --profile "$AWS_PROFILE" --region "$AWS_REGION"
+./scripts/run_producer.sh --n 100 --rate 20
 ```
+- Wrapper auto-loads `.env`/Terraform outputs for `QUEUE_URL`/`AWS_REGION`/`AWS_PROFILE`, creates a venv in `producer/.venv`, installs deps, and runs the script from the producer folder.
 - `--rate` limits messages/sec (`0` = as fast as possible)
 - `--batch-size` (max 10) controls batch size per API call
 
@@ -111,8 +112,9 @@ Default values for all environment variables are defined in `consumer/consume.py
 
 ## Producer usage
 ```bash
-python producer/produce.py --n 100 --rate 20 --queue-url "$QUEUE_URL" --profile "$AWS_PROFILE" --region "$AWS_REGION"
+./scripts/run_producer.sh --n 100 --rate 20
 ```
+- Wrapper auto-loads `.env`/Terraform outputs for `QUEUE_URL`/`AWS_REGION`/`AWS_PROFILE`, creates a venv in `producer/.venv`, installs deps, and runs the script from the producer folder.
 - `--rate` limits messages/sec (0 = as fast as possible)
 - `--batch-size` (max 10) controls batch payload per API call
 
