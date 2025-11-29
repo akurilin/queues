@@ -137,6 +137,17 @@ def describe_service(cluster: str, service: str) -> dict:
     return services[0]
 
 
+def describe_service_config(cluster: str, service: str) -> tuple[dict, int, list[str], list[str], str]:
+    """Fetch service description and unpack desired count, networking, and task def."""
+    service_desc = describe_service(cluster, service)
+    previous_desired = service_desc.get("desiredCount", 0)
+    awsvpc = service_desc["networkConfiguration"]["awsvpcConfiguration"]
+    subnets = awsvpc["subnets"]
+    security_groups = awsvpc["securityGroups"]
+    task_definition = service_desc["taskDefinition"]
+    return service_desc, previous_desired, subnets, security_groups, task_definition
+
+
 def update_service_desired(cluster: str, service: str, desired: int) -> None:
     """Update desired count for the ECS service and wait for stability."""
     subprocess.check_call(
@@ -256,6 +267,27 @@ def wait_for_queue_empty(
     raise RuntimeError("Queue did not drain within timeout")
 
 
+def purge_queue_if_needed(sqs: BaseClient, queue_url: str, label: str, timeout: int = 90) -> None:
+    """Purge the queue if it has messages and wait for it to be empty."""
+    depth = get_queue_depth(sqs, queue_url)
+    if depth["visible"] == 0 and depth["not_visible"] == 0:
+        return
+    print(f"[setup] Purging {label} queue (visible={depth['visible']} not_visible={depth['not_visible']}) ...")
+    sqs.purge_queue(QueueUrl=queue_url)
+    wait_for_queue_empty(sqs, queue_url, timeout=timeout)
+
+
+def clear_queues(sqs: BaseClient, queue_url: str, dlq_url: Optional[str], prefix: str) -> None:
+    """Ensure primary (and DLQ if present) are empty, purging if needed."""
+    print(f"{prefix} Clearing primary queue ...")
+    purge_queue_if_needed(sqs, queue_url, "primary")
+    ensure_queue_empty(sqs, queue_url, "primary")
+    if dlq_url:
+        print(f"{prefix} Clearing DLQ ...")
+        purge_queue_if_needed(sqs, dlq_url, "DLQ")
+        ensure_queue_empty(sqs, dlq_url, "DLQ")
+
+
 def run_producer(count: int, batch_size: int, region: str, queue_url: str, profile: str) -> None:
     """Invoke the producer script to push messages."""
     cmd = [
@@ -353,18 +385,15 @@ def scenario_happy(args: argparse.Namespace, env: Dict[str, str]) -> None:
     message_count = args.count or 5
     batch_size = min(args.batch_size or 5, 10)
 
-    print("[happy] Verifying primary queue is empty before start ...")
-    ensure_queue_empty(sqs, queue_url, "primary")
-    if dlq_url:
-        ensure_queue_empty(sqs, dlq_url, "DLQ")
+    clear_queues(sqs, queue_url, dlq_url, "[happy]")
 
-    service_desc = describe_service(cluster, service)
-    previous_desired = service_desc.get("desiredCount", 0)
-    subnets = service_desc["networkConfiguration"]["awsvpcConfiguration"]["subnets"]
-    security_groups = service_desc["networkConfiguration"]["awsvpcConfiguration"][
-        "securityGroups"
-    ]
-    task_definition = service_desc["taskDefinition"]
+    (
+        service_desc,
+        previous_desired,
+        subnets,
+        security_groups,
+        task_definition,
+    ) = describe_service_config(cluster, service)
 
     if previous_desired != 0:
         print(f"[happy] Scaling service {service} to 0 to avoid interference (was {previous_desired}) ...")
@@ -418,9 +447,11 @@ def scenario_crash(args: argparse.Namespace, env: Dict[str, str]) -> None:
     service = DEFAULT_ECS_SERVICE
     container = DEFAULT_ECS_CONTAINER
 
-    print("[crash] Verifying primary queue is empty before start ...")
+    print("[crash] Clearing queues before start ...")
+    purge_queue_if_needed(sqs, queue_url, "primary")
     ensure_queue_empty(sqs, queue_url, "primary")
     if dlq_url:
+        purge_queue_if_needed(sqs, dlq_url, "DLQ")
         ensure_queue_empty(sqs, dlq_url, "DLQ")
 
     message_count = 1
@@ -429,13 +460,13 @@ def scenario_crash(args: argparse.Namespace, env: Dict[str, str]) -> None:
     print("[crash] Confirming message is enqueued ...")
     wait_for_messages_enqueued(sqs, queue_url, message_count)
 
-    service_desc = describe_service(cluster, service)
-    previous_desired = service_desc.get("desiredCount", 0)
-    subnets = service_desc["networkConfiguration"]["awsvpcConfiguration"]["subnets"]
-    security_groups = service_desc["networkConfiguration"]["awsvpcConfiguration"][
-        "securityGroups"
-    ]
-    task_definition = service_desc["taskDefinition"]
+    (
+        service_desc,
+        previous_desired,
+        subnets,
+        security_groups,
+        task_definition,
+    ) = describe_service_config(cluster, service)
 
     if previous_desired != 0:
         print(f"[crash] Scaling service {service} to 0 to avoid interference (was {previous_desired}) ...")
@@ -527,7 +558,27 @@ def parse_args() -> argparse.Namespace:
         help="Timeout (seconds) for consumer subprocesses",
     )
 
+    clean = subparsers.add_parser("clean", help="Reset state: purge queues and exit")
+    clean.add_argument(
+        "--consumer-timeout",
+        type=int,
+        default=90,
+        help="Timeout placeholder (kept for symmetry; not used currently)",
+    )
+
     return parser.parse_args()
+
+
+def scenario_clean(env: Dict[str, str]) -> None:
+    """Scenario 0: Clean queues to a known empty state."""
+    queue_url = env["QUEUE_URL"]
+    region = env["AWS_REGION"]
+    profile = env.get("AWS_PROFILE", "")
+    dlq_url = queue_url_from_arn(env["DLQ_ARN"]) if env.get("DLQ_ARN") else None
+    sqs = build_sqs_client(region, profile)
+
+    clear_queues(sqs, queue_url, dlq_url, "[clean]")
+    print("[clean] PASS (queues empty)")
 
 
 def main() -> None:
@@ -540,6 +591,8 @@ def main() -> None:
         scenario_happy(args, env)
     elif args.scenario == "crash":
         scenario_crash(args, env)
+    elif args.scenario == "clean":
+        scenario_clean(env)
     else:
         raise SystemExit(f"Unknown scenario {args.scenario}")
 
