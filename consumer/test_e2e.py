@@ -119,7 +119,7 @@ def test_consumer_processes_and_deletes_message(tmp_path: Path) -> None:
         env.pop("AWS_PROFILE")
 
     consumer_proc = subprocess.Popen(
-        [sys.executable, "app.py"],
+        [sys.executable, "consume.py"],
         cwd=Path(__file__).parent,
         env=env,
         stdout=subprocess.PIPE,

@@ -4,6 +4,7 @@ set -euo pipefail
 REGION="${AWS_REGION:-us-west-1}"
 PROFILE="${AWS_PROFILE:-}"
 IMAGE_TAG="${IMAGE_TAG:-latest}"
+PLATFORM="${PLATFORM:-linux/amd64}"
 
 if [[ -n "$PROFILE" ]]; then
   AWS_ARGS=(--profile "$PROFILE")
@@ -24,10 +25,14 @@ if [[ -z "$REPO_URL" ]]; then
 fi
 
 echo "Logging in to ECR ($REGION) ..."
-aws "${AWS_ARGS[@]}" ecr get-login-password --region "$REGION" | docker login --username AWS --password-stdin "$REPO_URL"
+if [[ ${#AWS_ARGS[@]} -gt 0 ]]; then
+  aws "${AWS_ARGS[@]}" ecr get-login-password --region "$REGION" | docker login --username AWS --password-stdin "$REPO_URL"
+else
+  aws ecr get-login-password --region "$REGION" | docker login --username AWS --password-stdin "$REPO_URL"
+fi
 
-echo "Building consumer image: ${REPO_URL}:${IMAGE_TAG}"
-docker build -t "${REPO_URL}:${IMAGE_TAG}" "$(dirname "$0")/../consumer"
+echo "Building consumer image: ${REPO_URL}:${IMAGE_TAG} (platform: ${PLATFORM})"
+docker build --platform "${PLATFORM}" -t "${REPO_URL}:${IMAGE_TAG}" "$(dirname "$0")/../consumer"
 
 echo "Pushing image ..."
 docker push "${REPO_URL}:${IMAGE_TAG}"

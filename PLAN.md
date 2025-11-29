@@ -11,7 +11,7 @@ To-Do Tracker
 -------------
 - [x] Scaffold repo layout (terraform/, consumer/, producer/, scripts/, README.md stub).
 - [x] Terraform skeleton: providers/versions, VPC (public-only), SQS + DLQ module, hand-rolled ECS cluster/service/task, ECR repo, IAM roles, CloudWatch log group, outputs (queue URL/ARN, DLQ ARN, image URI), local_file for `.env`.
-- [x] Consumer: Dockerfile, app.py (long-poll loop, failure knobs: crash rate, long sleep to exceed visibility, optional idempotency tracking), requirements.txt.
+- [x] Consumer: Dockerfile, consume.py (long-poll loop, failure knobs: crash rate, long sleep to exceed visibility, optional idempotency tracking), requirements.txt.
 - [x] Producer: produce.py (N messages, optional rate, UUID payload, CLI args for queue URL/profile).
 - [x] Scripts: build_and_push.sh (login, build, tag, push), set_env.sh (optional helpers).
 - [x] README: usage (3-command flow), failure-mode experiments, scaling notes.
@@ -38,7 +38,7 @@ Repo Layout
   - Modules used: VPC, SQS queue; hand-rolled ECS/Fargate resources; ECR; optional local_file to emit `.env` with outputs
 - `consumer/`
   - `Dockerfile`
-  - `app.py` (single-threaded long-poll loop, supports failure simulation)
+  - `consume.py` (single-threaded long-poll loop, supports failure simulation)
   - `requirements.txt` (boto3)
 - `producer/`
   - `produce.py` (enqueue N messages, optional rate)
@@ -99,7 +99,7 @@ Security & Cost Notes
 Next Steps to Implement
 -----------------------
 1) Scaffold repo layout and Terraform skeleton with selected modules.
-2) Author consumer Dockerfile + app.py and producer script.
+2) Author consumer Dockerfile + consume.py and producer script.
 3) Write build/push helper script.
 4) Wire Terraform variables/outputs (queue URL/ARN, log group, image URI).
 5) Apply infra, push image, update service.
