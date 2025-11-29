@@ -1,10 +1,25 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+SCRIPT_DIR="$(cd -- "$(dirname "$0")" && pwd)"
+REPO_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
+
 REGION="${AWS_REGION:-us-west-1}"
 PROFILE="${AWS_PROFILE:-}"
-IMAGE_TAG="${IMAGE_TAG:-latest}"
 PLATFORM="${PLATFORM:-linux/amd64}"
+
+IMAGE_TAG="${IMAGE_TAG:-}"
+# Default to git SHA (with -dirty timestamp suffix if needed) when no tag provided.
+if [[ -z "$IMAGE_TAG" ]] && command -v git >/dev/null 2>&1 && git -C "$REPO_ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  GIT_SHA="$(git -C "$REPO_ROOT" rev-parse --short HEAD)"
+  if git -C "$REPO_ROOT" status --porcelain | grep -q .; then
+    IMAGE_TAG="${GIT_SHA}-dirty-$(date +%Y%m%d%H%M%S)"
+  else
+    IMAGE_TAG="$GIT_SHA"
+  fi
+fi
+# Final fallback if git is unavailable.
+IMAGE_TAG="${IMAGE_TAG:-latest}"
 
 if [[ -n "$PROFILE" ]]; then
   AWS_ARGS=(--profile "$PROFILE")
@@ -32,7 +47,7 @@ else
 fi
 
 echo "Building consumer image: ${REPO_URL}:${IMAGE_TAG} (platform: ${PLATFORM})"
-docker build --platform "${PLATFORM}" -t "${REPO_URL}:${IMAGE_TAG}" "$(dirname "$0")/../consumer"
+docker build --platform "${PLATFORM}" -t "${REPO_URL}:${IMAGE_TAG}" "${REPO_ROOT}/consumer"
 
 echo "Pushing image ..."
 docker push "${REPO_URL}:${IMAGE_TAG}"

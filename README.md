@@ -32,14 +32,15 @@ Repo contains:
 
 3) **Build and push the consumer image**  
    ```bash
-   IMAGE_TAG=latest ./scripts/build_and_push.sh
+   ./scripts/build_and_push.sh
    ```
+   - Defaults `IMAGE_TAG` to the current git SHA (appends `-dirty-<timestamp>` if the tree is dirty). Override by exporting `IMAGE_TAG=...` if you want a custom tag.
    - Uses `ECR_REPO` from `.env` or Terraform output.
    - Builds for amd64 by default (`PLATFORM=linux/amd64`), so Fargate can run it.
 
 4) **Point ECS at the pushed tag (if not `latest`)**  
    ```bash
-   terraform -chdir=terraform apply -auto-approve -var container_image_tag=${IMAGE_TAG:-latest}
+   terraform -chdir=terraform apply -auto-approve -var container_image_tag=${IMAGE_TAG:-$(git rev-parse --short HEAD)}
    ```
 
 5) **Run the producer locally to send messages**  
