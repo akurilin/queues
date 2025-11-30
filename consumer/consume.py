@@ -1,5 +1,6 @@
 """SQS consumer with configurable failure/sleep knobs for demo experiments."""
 
+import hashlib
 import json
 import logging
 import os
@@ -7,9 +8,11 @@ import random
 import sys
 import time
 from collections import deque
+from datetime import datetime, timezone
 from typing import Any, Callable, Deque, Dict, Optional
 
 import boto3
+from botocore.exceptions import ClientError
 
 
 class CrashError(Exception):
@@ -53,6 +56,128 @@ def build_sqs_client(region: Optional[str]) -> Any:
     """Create a boto3 SQS client scoped to the given region."""
     session = boto3.Session(region_name=region)
     return session.client("sqs")
+
+
+def build_dynamo_resource(region: Optional[str]) -> Any:
+    """Create a boto3 DynamoDB resource scoped to the given region."""
+    session = boto3.Session(region_name=region)
+    return session.resource("dynamodb")
+
+
+def now_iso() -> str:
+    """UTC timestamp for table writes."""
+    return datetime.utcnow().replace(tzinfo=timezone.utc).isoformat()
+
+
+def payload_digest(payload: Any) -> str:
+    """Deterministic digest for the payload to help with debugging/idempotency."""
+    try:
+        rendered = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    except TypeError:
+        rendered = repr(payload)
+    return hashlib.sha256(rendered.encode("utf-8")).hexdigest()
+
+
+class DynamoTracker:
+    """Dynamo-backed idempotency helper for duplicate deliveries."""
+
+    def __init__(self, resource: Any, status_table: str, completed_table: str) -> None:
+        self.status_table = resource.Table(status_table)
+        self.completed_table = resource.Table(completed_table)
+
+    @staticmethod
+    def _is_conditional_failure(exc: ClientError) -> bool:
+        return exc.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException"
+
+    def mark_started(self, message_id: str, payload: Any) -> str:
+        """Record STARTED; return status state (new|existing|completed)."""
+        timestamp = now_iso()
+        digest = payload_digest(payload)
+        try:
+            self.status_table.put_item(
+                Item={
+                    "message_id": message_id,
+                    "status": "STARTED",
+                    "attempts": 1,
+                    "last_updated": timestamp,
+                    "payload_digest": digest,
+                },
+                ConditionExpression="attribute_not_exists(message_id)",
+            )
+            return "new"
+        except ClientError as exc:
+            if not self._is_conditional_failure(exc):
+                logger.warning("Failed to write STARTED for %s: %s", message_id, exc)
+                return "error"
+
+        status = None
+        try:
+            response = self.status_table.get_item(Key={"message_id": message_id})
+            status = response.get("Item", {}).get("status")
+        except ClientError as exc:
+            logger.warning("Failed to fetch existing status for %s: %s", message_id, exc)
+
+        try:
+            self.status_table.update_item(
+                Key={"message_id": message_id},
+                UpdateExpression="SET attempts = if_not_exists(attempts, :zero) + :one, last_updated=:now",
+                ExpressionAttributeValues={
+                    ":zero": 0,
+                    ":one": 1,
+                    ":now": timestamp,
+                },
+                ConditionExpression="attribute_exists(message_id)",
+            )
+        except ClientError as exc:
+            if not self._is_conditional_failure(exc):
+                logger.warning("Failed to bump attempts for %s: %s", message_id, exc)
+
+        if status == "COMPLETED":
+            return "completed"
+        return "existing"
+
+    def mark_completed(self, message_id: str, payload: Any) -> str:
+        """Record completion with idempotent conditional writes."""
+        timestamp = now_iso()
+        digest = payload_digest(payload)
+        completion_recorded = False
+
+        try:
+            self.completed_table.put_item(
+                Item={
+                    "message_id": message_id,
+                    "processed_at": timestamp,
+                    "payload_digest": digest,
+                },
+                ConditionExpression="attribute_not_exists(message_id)",
+            )
+            completion_recorded = True
+        except ClientError as exc:
+            if not self._is_conditional_failure(exc):
+                logger.warning("Failed to write completion for %s: %s", message_id, exc)
+
+        try:
+            self.status_table.update_item(
+                Key={"message_id": message_id},
+                UpdateExpression=(
+                    "SET #s = :completed, attempts = if_not_exists(attempts, :zero) + :one, "
+                    "last_updated = :now, error_reason = :empty"
+                ),
+                ExpressionAttributeNames={"#s": "status"},
+                ExpressionAttributeValues={
+                    ":completed": "COMPLETED",
+                    ":one": 1,
+                    ":zero": 0,
+                    ":now": timestamp,
+                    ":empty": "",
+                },
+                ConditionExpression="attribute_exists(message_id)",
+            )
+        except ClientError as exc:
+            if not self._is_conditional_failure(exc):
+                logger.warning("Failed to update status to COMPLETED for %s: %s", message_id, exc)
+
+        return "new_completion" if completion_recorded else "duplicate_completion"
 
 
 def main() -> None:
@@ -115,6 +240,18 @@ def main() -> None:
 
     # Create SQS client for making API calls
     sqs = build_sqs_client(region)
+    # Optional Dynamo tracker for cross-consumer idempotency
+    dynamo_tracker: Optional[DynamoTracker] = None
+    status_table = os.getenv("MESSAGE_STATUS_TABLE")
+    completed_table = os.getenv("MESSAGE_COMPLETED_TABLE")
+    if status_table and completed_table:
+        dynamo_resource = build_dynamo_resource(region)
+        dynamo_tracker = DynamoTracker(dynamo_resource, status_table, completed_table)
+        logger.info(
+            "DynamoDB tracking enabled | status_table=%s completed_table=%s",
+            status_table,
+            completed_table,
+        )
 
     # Optional in-memory dedupe to simulate idempotency handling.
     # Create a bounded deque to track recent message IDs (FIFO with max size)
@@ -197,6 +334,7 @@ def main() -> None:
                         crash_after_receive,
                         is_duplicate,
                         remember_message_id,
+                        dynamo_tracker,
                     )
                     # Check if we've hit the optional message limit (for testing)
                     if message_limit and processed_count >= message_limit:
@@ -237,6 +375,7 @@ def handle_message(
     crash_after_receive: bool,
     is_duplicate: Callable[[str], bool],
     remember_message_id: Callable[[str], None],
+    dynamo_tracker: Optional[DynamoTracker],
 ) -> None:
     """Process a single message with optional chaos behaviors."""
     # Extract raw message body from SQS message structure
@@ -255,6 +394,16 @@ def handle_message(
         message_id = payload.get("id")
     # Fall back to SQS-generated MessageId if no custom ID found
     message_id = message_id or message.get("MessageId")
+
+    tracker_state = None
+    if message_id and dynamo_tracker:
+        tracker_state = dynamo_tracker.mark_started(message_id, payload)
+        if tracker_state == "completed":
+            logger.info("Skipping already completed message id=%s", message_id)
+            delete_message(sqs_client, queue_url, message)
+            if message_id:
+                remember_message_id(message_id)
+            return
 
     # Check if this message has been processed before (idempotency check)
     if message_id and is_duplicate(message_id):
@@ -290,6 +439,10 @@ def handle_message(
     if crash_after_receive:
         raise CrashError("Intentional post-receive crash for testing")
 
+    completion_state = None
+    if message_id and dynamo_tracker:
+        completion_state = dynamo_tracker.mark_completed(message_id, payload)
+
     # Delete message from queue after successful processing (prevents redelivery)
     delete_message(sqs_client, queue_url, message)
 
@@ -298,15 +451,24 @@ def handle_message(
         remember_message_id(message_id)
 
     # Log successful completion of message processing
-    logger.info("Done message id=%s", message_id)
+    if completion_state == "duplicate_completion":
+        logger.info("Done message id=%s (detected duplicate completion)", message_id)
+    else:
+        logger.info("Done message id=%s", message_id)
 
 
 def delete_message(sqs_client, queue_url: str, message: Dict[str, Any]) -> None:
     """Remove the processed message from the queue."""
-    sqs_client.delete_message(
-        QueueUrl=queue_url,
-        ReceiptHandle=message["ReceiptHandle"],
-    )
+    try:
+        sqs_client.delete_message(
+            QueueUrl=queue_url,
+            ReceiptHandle=message["ReceiptHandle"],
+        )
+    except ClientError as exc:
+        if exc.response.get("Error", {}).get("Code") == "ReceiptHandleIsInvalid":
+            logger.warning("Could not delete message (stale receipt handle); assuming it was already reclaimed")
+            return
+        raise
 
 
 if __name__ == "__main__":

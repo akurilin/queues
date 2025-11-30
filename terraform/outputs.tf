@@ -32,3 +32,13 @@ output "log_group_name" {
   value       = aws_cloudwatch_log_group.consumer.name
   description = "CloudWatch Logs group for the consumer"
 }
+
+output "message_status_table" {
+  value       = aws_dynamodb_table.message_status.name
+  description = "DynamoDB table for message status tracking"
+}
+
+output "message_completed_table" {
+  value       = aws_dynamodb_table.message_completed.name
+  description = "DynamoDB table for completion idempotency"
+}

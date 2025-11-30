@@ -4,6 +4,8 @@ locals {
   env_file_path   = "${path.module}/../.env"
   ecr_repo_name   = "${var.project_name}/consumer"
   container_image = "${aws_ecr_repository.consumer.repository_url}:${var.container_image_tag}"
+  status_table    = "${var.project_name}-message-status"
+  completed_table = "${var.project_name}-message-completed"
 }
 
 data "aws_caller_identity" "current" {}
@@ -133,6 +135,19 @@ data "aws_iam_policy_document" "task" {
       module.sqs.dead_letter_queue_arn
     ]
   }
+
+  statement {
+    actions = [
+      "dynamodb:PutItem",
+      "dynamodb:UpdateItem",
+      "dynamodb:TransactWriteItems",
+      "dynamodb:GetItem"
+    ]
+    resources = [
+      aws_dynamodb_table.message_status.arn,
+      aws_dynamodb_table.message_completed.arn
+    ]
+  }
 }
 
 resource "aws_iam_policy" "task" {
@@ -178,7 +193,9 @@ resource "aws_ecs_task_definition" "consumer" {
       essential = true
       environment = [
         { name = "QUEUE_URL", value = module.sqs.queue_url },
-        { name = "AWS_REGION", value = var.aws_region }
+        { name = "AWS_REGION", value = var.aws_region },
+        { name = "MESSAGE_STATUS_TABLE", value = local.status_table },
+        { name = "MESSAGE_COMPLETED_TABLE", value = local.completed_table }
       ]
       logConfiguration = {
         logDriver = "awslogs"
@@ -215,5 +232,29 @@ QUEUE_URL=${module.sqs.queue_url}
 DLQ_ARN=${module.sqs.dead_letter_queue_arn}
 ECR_REPO=${aws_ecr_repository.consumer.repository_url}
 AWS_REGION=${var.aws_region}
+MESSAGE_STATUS_TABLE=${aws_dynamodb_table.message_status.name}
+MESSAGE_COMPLETED_TABLE=${aws_dynamodb_table.message_completed.name}
 EOT
+}
+
+resource "aws_dynamodb_table" "message_status" {
+  name         = local.status_table
+  billing_mode = "PAY_PER_REQUEST"
+  hash_key     = "message_id"
+
+  attribute {
+    name = "message_id"
+    type = "S"
+  }
+}
+
+resource "aws_dynamodb_table" "message_completed" {
+  name         = local.completed_table
+  billing_mode = "PAY_PER_REQUEST"
+  hash_key     = "message_id"
+
+  attribute {
+    name = "message_id"
+    type = "S"
+  }
 }
