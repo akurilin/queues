@@ -6,12 +6,14 @@ Minimal-but-complete SQS workflow. Terraform creates:
 - ECR repo for the consumer image
 - ECS Fargate cluster/service/task for the consumer
 - CloudWatch log group
+- Two DynamoDB tables to simulate side effects and to track per-message processing state
 
 Repo contains:
 - `consumer/`: Python SQS consumer (Dockerized) with failure-mode knobs.
 - `producer/`: Local Python script to enqueue messages.
 - `scripts/`: Build/push helper, env helper.
 - `terraform/`: Infra definitions (local state).
+- `scenarios/`: Self-contained runnable scenarios that mimic common queue situations (happy path, crashed consumer recovery, duplicate processing).
 
 ## Prerequisites
 - AWS CLI configured with a profile that can create VPC/ECR/ECS/SQS
@@ -125,7 +127,29 @@ Default values for all environment variables are defined in `consumer/consume.py
 - Burst load: `producer --n 1000 --rate 0` → observe SQS metrics and processing throughput
 - Kill task from console while processing → message should reappear due to no delete
 
+## Scenarios
+- `scenarios/` contains small, isolated setups you can run to exercise typical flows:
+  - Happy path: messages flow through cleanly.
+  - Crashed consumer: observe redelivery and recovery.
+  - Duplicate message processing: see how idempotency behaves.
+
+### Running scenarios quickly
+- Prereqs: infra provisioned (so `.env` exists with `QUEUE_URL`, `DLQ_ARN`, `MESSAGE_STATUS_TABLE`, `MESSAGE_COMPLETED_TABLE`, `AWS_REGION`, optional `AWS_PROFILE`), AWS CLI on PATH.
+- One-time setup: `python -m venv scenarios/.venv && source scenarios/.venv/bin/activate && pip install -r scenarios/requirements.txt`
+- Run from repo root with the venv active:
+  - Happy path: `python scenarios/run.py happy --count 5 --batch-size 5`
+  - Crash/retry: `python scenarios/run.py crash --visibility-wait 15`
+  - Duplicate handling (uses both Dynamo tables): `python scenarios/run.py duplicates --slow-seconds 30 --second-start-delay 0`
+  - Reset state: `python scenarios/run.py clean`
+- The runner scales the ECS service to 0 temporarily to avoid interference, then restores the previous desired count when done.
+
 ## Tear down
 ```bash
 terraform -chdir=terraform destroy -auto-approve
 ```
+
+# WIP
+- It would be great to not have to manually create tasks for some of the scenarios, relying on the ones spun up by terraform
+- Moving testing scenarios to a local environment would be a real time saver, although would lose true e2e test value
+- A few more scenarios to implement
+- The scenario runner is pretty complex at the moment
