@@ -1,6 +1,6 @@
 # SQS Demo
 
-Minimal-but-complete SQS workflow. Terraform creates:
+Minimal-but-complete SQS workflow. Entirely vibe-coded. Terraform creates:
 - VPC (public subnets)
 - SQS queue + DLQ
 - ECR repo for the consumer image
