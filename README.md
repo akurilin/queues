@@ -90,14 +90,9 @@ Repo contains:
 - Burst load: `producer --n 1000 --rate 0`
 - Kill a task mid-run: message should redeliver (not deleted)
 
-## Current deployed outputs (us-west-1)
-- `queue_url`: https://sqs.us-west-1.amazonaws.com/618170664907/sqs-demo-queue
-- `queue_arn`: arn:aws:sqs:us-west-1:618170664907:sqs-demo-queue
-- `dlq_arn`: arn:aws:sqs:us-west-1:618170664907:sqs-demo-queue-dlq
-- `ecr_repository_url`: 618170664907.dkr.ecr.us-west-1.amazonaws.com/sqs-demo/consumer
-- `log_group_name`: /aws/ecs/sqs-demo-consumer
-- `ecs_cluster_name`: sqs-demo-cluster
-- `ecs_service_name`: sqs-demo-service
+## Environment config
+- Terraform writes a `.env` at repo root with `QUEUE_URL`, `DLQ_ARN`, `ECR_REPO`, `AWS_REGION`, `MESSAGE_STATUS_TABLE`, and `MESSAGE_COMPLETED_TABLE`. Optional: `AWS_PROFILE`, `IMAGE_TAG`.
+- If you prefer manual setup, copy `.env.example` to `.env` and fill in your account-specific values; scripts/loaders will pick it up.
 
 ## Consumer knobs (env vars)
 - `QUEUE_URL` (required) – queue to poll
