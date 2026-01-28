@@ -157,14 +157,14 @@ Each message contains a JSON payload with a UUID `id` and a random `work` value 
 | `log_retention_days` | `14` | CloudWatch log retention (days) |
 
 ## Scenarios
-`scenarios/` contains self-contained setups to exercise typical queue behaviors:
+`scenarios/` contains self-contained setups to exercise typical queue behaviors. Each scenario provisions its own isolated infrastructure (SQS queue + DLQ, DynamoDB tables, ECS cluster + task definition, task IAM role) via `scenarios/terraform/`, runs the test, and tears everything down afterwards. Shared resources (VPC, execution role, CloudWatch, ECR) come from the main terraform.
+
 - **Happy path**: messages flow through cleanly, all processed and deleted.
 - **Crashed consumer**: observe redelivery and recovery after worker crashes.
 - **Duplicate message processing**: see how DynamoDB-backed idempotency handles redelivered messages.
-- **Clean**: reset DynamoDB table state for fresh runs.
 
 ### Running scenarios
-- **Prereqs**: infra provisioned (so `.env` exists with `QUEUE_URL`, `DLQ_ARN`, `MESSAGE_STATUS_TABLE`, `MESSAGE_COMPLETED_TABLE`, `AWS_REGION`, optional `AWS_PROFILE`), AWS CLI on PATH.
+- **Prereqs**: main infra provisioned (`terraform -chdir=terraform apply`), consumer image pushed to ECR, AWS CLI + Terraform on PATH.
 - **One-time setup**:
   ```bash
   python -m venv scenarios/.venv && source scenarios/.venv/bin/activate
@@ -175,9 +175,19 @@ Each message contains a JSON payload with a UUID `id` and a random `work` value 
   python scenarios/run.py happy --count 5 --batch-size 5
   python scenarios/run.py crash --visibility-wait 15
   python scenarios/run.py duplicates --slow-seconds 30 --second-start-delay 0
-  python scenarios/run.py clean
   ```
-- The runner scales the ECS service to 0 temporarily to avoid interference, then restores the previous desired count when done.
+- Use `--image-tag <tag>` to specify a container image tag (default: `latest`).
+- Each run creates a Terraform workspace, provisions per-scenario resources, validates them, runs the scenario, then destroys everything.
+
+### Validating infrastructure
+You can validate infrastructure independently:
+```bash
+# Validate shared (main) infrastructure
+python scenarios/validate_infra.py --main
+
+# Validate a specific scenario workspace
+python scenarios/validate_infra.py --workspace happy-a1b2c3d4
+```
 
 ## Tear down
 ```bash
@@ -185,7 +195,5 @@ terraform -chdir=terraform destroy -auto-approve
 ```
 
 ## WIP
-- It would be great to not have to manually create tasks for some of the scenarios, relying on the ones spun up by terraform
 - Moving testing scenarios to a local environment would be a real time saver, although would lose true e2e test value
 - A few more scenarios to implement
-- The scenario runner is pretty complex at the moment

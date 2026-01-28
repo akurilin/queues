@@ -1,14 +1,16 @@
-"""Scenario runner for queue behaviors (initial focus: happy path + crash)."""
+"""Scenario runner for queue behaviors with per-scenario infrastructure."""
 
 from __future__ import annotations
 
 import argparse
 import json
 import os
+import secrets
 import subprocess
 import sys
 import time
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Dict, Optional
 
@@ -16,47 +18,143 @@ import boto3
 from botocore.client import BaseClient
 from botocore.session import Session
 
+from validate_infra import validate_scenario_infra
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+SCENARIOS_TF_DIR = Path(__file__).resolve().parent / "terraform"
 DEFAULT_VISIBILITY_BUFFER = 15  # seconds to wait for visibility timeout expiry
-DEFAULT_ECS_CLUSTER = os.getenv("ECS_CLUSTER", "sqs-demo-cluster")
-DEFAULT_ECS_SERVICE = os.getenv("ECS_SERVICE", "sqs-demo-service")
-DEFAULT_ECS_CONTAINER = os.getenv("ECS_CONTAINER", "sqs-demo-consumer")
 
 
-def load_env_file() -> Dict[str, str]:
-    """Load simple KEY=VALUE pairs from .env if present."""
-    env_path = REPO_ROOT / ".env"
-    values: Dict[str, str] = {}
-    if not env_path.exists():
-        return values
-    for line in env_path.read_text().splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, val = line.split("=", 1)
-        values[key.strip()] = val.strip()
-    return values
+# ---------------------------------------------------------------------------
+# Terraform lifecycle
+# ---------------------------------------------------------------------------
 
 
-def resolve_env(overrides: Optional[Dict[str, str]] = None) -> Dict[str, str]:
-    """Resolve environment values from process env, .env file, then overrides."""
-    env_file = load_env_file()
-    resolved: Dict[str, str] = {}
-    resolved["QUEUE_URL"] = os.environ.get("QUEUE_URL") or env_file.get("QUEUE_URL", "")
-    resolved["AWS_REGION"] = (
-        os.environ.get("AWS_REGION") or env_file.get("AWS_REGION") or "us-west-1"
+def terraform_cmd(
+    args: list[str], tf_dir: Optional[str] = None, stream: bool = False
+) -> subprocess.CompletedProcess:
+    """Run a terraform command in the scenarios/terraform/ directory.
+
+    When *stream* is True the command's stdout/stderr go straight to the
+    terminal so the user can watch progress (useful for apply/destroy).
+    """
+    cwd = tf_dir or str(SCENARIOS_TF_DIR)
+    cmd = ["terraform", f"-chdir={cwd}"] + args
+    if stream:
+        return subprocess.run(cmd, text=True, check=True)
+    return subprocess.run(cmd, capture_output=True, text=True, check=True)
+
+
+def generate_workspace_name(scenario: str) -> str:
+    """Return a unique workspace name: {scenario}-{random_8_hex}."""
+    return f"{scenario}-{secrets.token_hex(4)}"
+
+
+def _tfvars_path(workspace: str) -> Path:
+    """Return the path to the workspace-specific .tfvars file."""
+    return SCENARIOS_TF_DIR / f"{workspace}.tfvars.json"
+
+
+def get_main_tf_outputs() -> Dict[str, str]:
+    """Read terraform outputs from the main infrastructure."""
+    result = subprocess.run(
+        ["terraform", f"-chdir={REPO_ROOT / 'terraform'}", "output", "-json"],
+        capture_output=True,
+        text=True,
+        check=True,
     )
-    profile = os.environ.get("AWS_PROFILE") or env_file.get("AWS_PROFILE") or ""
-    if profile:
-        resolved["AWS_PROFILE"] = profile
-    for key in ("DLQ_ARN", "MESSAGE_STATUS_TABLE", "MESSAGE_COMPLETED_TABLE"):
-        value = os.environ.get(key) or env_file.get(key)
-        if value:
-            resolved[key] = value
-    if overrides:
-        resolved.update({k: v for k, v in overrides.items() if v is not None})
-    return resolved
+    raw = json.loads(result.stdout)
+    return {k: v["value"] for k, v in raw.items()}
+
+
+def infra_up(
+    scenario: str,
+    container_image: str,
+    main_outputs: Dict,
+    tf_vars: Optional[Dict[str, str]] = None,
+) -> Dict:
+    """Provision per-scenario infrastructure. Returns terraform outputs + _workspace."""
+    workspace = generate_workspace_name(scenario)
+    tfvars = _tfvars_path(workspace)
+
+    # Build tfvars
+    vars_dict = {
+        "scenario_name": workspace,
+        "container_image": container_image,
+        "aws_region": main_outputs.get("aws_region", os.environ.get("AWS_REGION", "us-west-1")),
+        "subnets": main_outputs["subnet_ids"],
+        "security_group_ids": main_outputs["security_group_ids"],
+        "execution_role_arn": main_outputs["execution_role_arn"],
+        "log_group_name": main_outputs["log_group_name"],
+    }
+    if tf_vars:
+        vars_dict.update(tf_vars)
+
+    tfvars.write_text(json.dumps(vars_dict, indent=2))
+    print(f"[infra] Wrote {tfvars}")
+
+    print(f"[infra] terraform init ...")
+    terraform_cmd(["init", "-input=false"])
+
+    print(f"[infra] Creating workspace {workspace} ...")
+    terraform_cmd(["workspace", "new", workspace])
+
+    print(f"[infra] terraform apply ...")
+    terraform_cmd(["apply", "-auto-approve", f"-var-file={tfvars}"], stream=True)
+
+    print(f"[infra] Reading outputs ...")
+    result = terraform_cmd(["output", "-json"])
+    raw = json.loads(result.stdout)
+    outputs = {k: v["value"] for k, v in raw.items()}
+    outputs["_workspace"] = workspace
+    outputs["_container_image"] = container_image
+    return outputs
+
+
+def infra_down(workspace: str) -> None:
+    """Destroy per-scenario infrastructure and clean up workspace."""
+    tfvars = _tfvars_path(workspace)
+    try:
+        print(f"[infra] Selecting workspace {workspace} ...")
+        terraform_cmd(["workspace", "select", workspace])
+
+        print(f"[infra] terraform destroy ...")
+        if tfvars.exists():
+            terraform_cmd(["destroy", "-auto-approve", f"-var-file={tfvars}"], stream=True)
+        else:
+            terraform_cmd(["destroy", "-auto-approve"], stream=True)
+
+        print(f"[infra] Cleaning up workspace {workspace} ...")
+        terraform_cmd(["workspace", "select", "default"])
+        terraform_cmd(["workspace", "delete", workspace])
+    finally:
+        if tfvars.exists():
+            tfvars.unlink()
+            print(f"[infra] Removed {tfvars}")
+
+
+@contextmanager
+def scenario_infra(
+    scenario: str,
+    container_image: str,
+    main_outputs: Dict,
+    tf_vars: Optional[Dict[str, str]] = None,
+):
+    """Context manager: provision → validate → yield outputs → destroy."""
+    outputs = infra_up(scenario, container_image, main_outputs, tf_vars)
+    workspace = outputs["_workspace"]
+    try:
+        profile = os.environ.get("AWS_PROFILE")
+        region = outputs.get("aws_region", "us-west-1")
+        validate_scenario_infra(outputs, main_outputs, region, profile, container_image)
+        yield outputs
+    finally:
+        infra_down(workspace)
+
+
+# ---------------------------------------------------------------------------
+# AWS helpers
+# ---------------------------------------------------------------------------
 
 
 def build_sqs_client(region: str, profile: Optional[str]) -> BaseClient:
@@ -69,23 +167,6 @@ def build_dynamo_resource(region: str, profile: Optional[str]):
     """Construct a DynamoDB resource using region/profile."""
     session: Session = boto3.Session(region_name=region, profile_name=profile or None)
     return session.resource("dynamodb")
-
-
-def clear_dynamo_tables(dynamo, table_names: list[str], prefix: str = "") -> None:
-    """Delete all items from the given DynamoDB tables."""
-    for name in table_names:
-        table = dynamo.Table(name)
-        print(f"{prefix} Clearing DynamoDB table {name} ...")
-        while True:
-            resp = table.scan(ProjectionExpression="message_id")
-            items = resp.get("Items", [])
-            if not items:
-                break
-            with table.batch_writer() as batch:
-                for item in items:
-                    batch.delete_item(Key={"message_id": item["message_id"]})
-            if "LastEvaluatedKey" not in resp:
-                break
 
 
 def get_queue_depth(sqs: BaseClient, queue_url: str) -> Dict[str, int]:
@@ -141,69 +222,22 @@ def wait_for_messages_enqueued(
     )
 
 
-# --- ECS helpers ---
+def wait_for_queue_empty(
+    sqs: BaseClient, queue_url: str, timeout: int = 90, poll_seconds: int = 3
+) -> None:
+    """Wait until both visible and in-flight counts drop to zero or timeout."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        depth = get_queue_depth(sqs, queue_url)
+        if depth["visible"] == 0 and depth["not_visible"] == 0:
+            return
+        time.sleep(poll_seconds)
+    raise RuntimeError("Queue did not drain within timeout")
 
 
-def describe_service(cluster: str, service: str) -> dict:
-    """Describe the ECS service to fetch network config and desired count."""
-    data = subprocess.check_output(
-        [
-            "aws",
-            "ecs",
-            "describe-services",
-            "--cluster",
-            cluster,
-            "--services",
-            service,
-        ]
-    )
-    import json
-
-    payload = json.loads(data)
-    services = payload.get("services", [])
-    if not services:
-        raise RuntimeError(f"ECS service {service} not found on cluster {cluster}")
-    return services[0]
-
-
-def describe_service_config(cluster: str, service: str) -> tuple[dict, int, list[str], list[str], str]:
-    """Fetch service description and unpack desired count, networking, and task def."""
-    service_desc = describe_service(cluster, service)
-    previous_desired = service_desc.get("desiredCount", 0)
-    awsvpc = service_desc["networkConfiguration"]["awsvpcConfiguration"]
-    subnets = awsvpc["subnets"]
-    security_groups = awsvpc["securityGroups"]
-    task_definition = service_desc["taskDefinition"]
-    return service_desc, previous_desired, subnets, security_groups, task_definition
-
-
-def update_service_desired(cluster: str, service: str, desired: int) -> None:
-    """Update desired count for the ECS service and wait for stability."""
-    subprocess.check_call(
-        [
-            "aws",
-            "ecs",
-            "update-service",
-            "--cluster",
-            cluster,
-            "--service",
-            service,
-            "--desired-count",
-            str(desired),
-        ]
-    )
-    subprocess.check_call(
-        [
-            "aws",
-            "ecs",
-            "wait",
-            "services-stable",
-            "--cluster",
-            cluster,
-            "--services",
-            service,
-        ]
-    )
+# ---------------------------------------------------------------------------
+# ECS helpers
+# ---------------------------------------------------------------------------
 
 
 def run_ecs_task(
@@ -216,8 +250,6 @@ def run_ecs_task(
 ) -> str:
     """Start a one-off ECS task with env overrides; return task ARN."""
     env_overrides = [{"name": k, "value": v} for k, v in env.items()]
-    import json
-
     cmd = [
         "aws",
         "ecs",
@@ -265,8 +297,6 @@ def wait_for_task_stop(cluster: str, task_arn: str, timeout: int = 300) -> dict:
         desc = subprocess.check_output(
             ["aws", "ecs", "describe-tasks", "--cluster", cluster, "--tasks", task_arn]
         )
-        import json
-
         payload = json.loads(desc)
         tasks = payload.get("tasks", [])
         if tasks and tasks[0].get("lastStatus") == "STOPPED":
@@ -283,38 +313,9 @@ def get_container_exit_code(task: dict, container_name: str) -> Optional[int]:
     return None
 
 
-def wait_for_queue_empty(
-    sqs: BaseClient, queue_url: str, timeout: int = 90, poll_seconds: int = 3
-) -> None:
-    """Wait until both visible and in-flight counts drop to zero or timeout."""
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        depth = get_queue_depth(sqs, queue_url)
-        if depth["visible"] == 0 and depth["not_visible"] == 0:
-            return
-        time.sleep(poll_seconds)
-    raise RuntimeError("Queue did not drain within timeout")
-
-
-def purge_queue_if_needed(sqs: BaseClient, queue_url: str, label: str, timeout: int = 90) -> None:
-    """Purge the queue if it has messages and wait for it to be empty."""
-    depth = get_queue_depth(sqs, queue_url)
-    if depth["visible"] == 0 and depth["not_visible"] == 0:
-        return
-    print(f"[setup] Purging {label} queue (visible={depth['visible']} not_visible={depth['not_visible']}) ...")
-    sqs.purge_queue(QueueUrl=queue_url)
-    wait_for_queue_empty(sqs, queue_url, timeout=timeout)
-
-
-def clear_queues(sqs: BaseClient, queue_url: str, dlq_url: Optional[str], prefix: str) -> None:
-    """Ensure primary (and DLQ if present) are empty, purging if needed."""
-    print(f"{prefix} Clearing primary queue ...")
-    purge_queue_if_needed(sqs, queue_url, "primary")
-    ensure_queue_empty(sqs, queue_url, "primary")
-    if dlq_url:
-        print(f"{prefix} Clearing DLQ ...")
-        purge_queue_if_needed(sqs, dlq_url, "DLQ")
-        ensure_queue_empty(sqs, dlq_url, "DLQ")
+# ---------------------------------------------------------------------------
+# Producer helper
+# ---------------------------------------------------------------------------
 
 
 def run_producer(count: int, batch_size: int, region: str, queue_url: str, profile: str) -> None:
@@ -336,97 +337,27 @@ def run_producer(count: int, batch_size: int, region: str, queue_url: str, profi
     subprocess.run(cmd, check=True)
 
 
-def run_consumer(
-    queue_url: str,
-    region: str,
-    profile: str,
-    extra_env: Optional[Dict[str, str]] = None,
-    expect_success: bool = True,
-    timeout: int = 120,
-) -> subprocess.CompletedProcess:
-    """Run the consumer script with env overrides."""
-    env = os.environ.copy()
-    env.update(
-        {
-            "QUEUE_URL": queue_url,
-            "AWS_REGION": region,
-        }
-    )
-    if profile:
-        env["AWS_PROFILE"] = profile
-    if extra_env:
-        env.update(extra_env)
-
-    cmd = [sys.executable, str(REPO_ROOT / "consumer" / "consume.py")]
-    result = subprocess.run(cmd, env=env, timeout=timeout, check=False)
-    if expect_success and result.returncode != 0:
-        raise RuntimeError(f"Consumer failed unexpectedly (exit {result.returncode})")
-    if not expect_success and result.returncode == 0:
-        raise RuntimeError("Consumer was expected to fail but exited 0")
-    return result
+# ---------------------------------------------------------------------------
+# Scenarios
+# ---------------------------------------------------------------------------
 
 
-def start_consumer_process(
-    queue_url: str,
-    region: str,
-    profile: str,
-    extra_env: Optional[Dict[str, str]] = None,
-) -> subprocess.Popen:
-    """Start the consumer process without waiting for completion."""
-    env = os.environ.copy()
-    env.update(
-        {
-            "QUEUE_URL": queue_url,
-            "AWS_REGION": region,
-        }
-    )
-    if profile:
-        env["AWS_PROFILE"] = profile
-    if extra_env:
-        env.update(extra_env)
-
-    cmd = [sys.executable, str(REPO_ROOT / "consumer" / "consume.py")]
-    return subprocess.Popen(cmd, env=env)
-
-
-def stop_consumer_process(proc: subprocess.Popen, timeout: int = 10) -> None:
-    """Attempt graceful stop, then kill if needed."""
-    if proc.poll() is not None:
-        return
-    proc.terminate()
-    try:
-        proc.wait(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-
-
-def scenario_happy(args: argparse.Namespace, env: Dict[str, str]) -> None:
-    """Scenario 1: Happy path."""
-    queue_url = env["QUEUE_URL"]
-    region = env["AWS_REGION"]
-    profile = env.get("AWS_PROFILE", "")
-    dlq_url = queue_url_from_arn(env["DLQ_ARN"]) if env.get("DLQ_ARN") else None
+def scenario_happy(args: argparse.Namespace, outputs: Dict, main_outputs: Dict) -> None:
+    """Scenario 1: Happy path — messages flow through cleanly."""
+    queue_url = outputs["queue_url"]
+    region = outputs["aws_region"]
+    profile = os.environ.get("AWS_PROFILE", "")
+    dlq_url = queue_url_from_arn(outputs["dlq_arn"])
     sqs = build_sqs_client(region, profile)
-    cluster = DEFAULT_ECS_CLUSTER
-    service = DEFAULT_ECS_SERVICE
-    container = DEFAULT_ECS_CONTAINER
+
+    cluster = outputs["cluster_name"]
+    task_definition = outputs["task_definition_arn"]
+    container = outputs["container_name"]
+    subnets = main_outputs["subnet_ids"]
+    security_groups = main_outputs["security_group_ids"]
 
     message_count = args.count or 5
     batch_size = min(args.batch_size or 5, 10)
-
-    clear_queues(sqs, queue_url, dlq_url, "[happy]")
-
-    (
-        service_desc,
-        previous_desired,
-        subnets,
-        security_groups,
-        task_definition,
-    ) = describe_service_config(cluster, service)
-
-    if previous_desired != 0:
-        print(f"[happy] Scaling service {service} to 0 to avoid interference (was {previous_desired}) ...")
-        update_service_desired(cluster, service, 0)
 
     print(f"[happy] Sending {message_count} messages ...")
     run_producer(message_count, batch_size, region, queue_url, profile)
@@ -456,50 +387,29 @@ def scenario_happy(args: argparse.Namespace, env: Dict[str, str]) -> None:
     print("[happy] Waiting for queue to drain ...")
     wait_for_queue_empty(sqs, queue_url)
     ensure_queue_empty(sqs, queue_url, "primary")
-    if dlq_url:
-        ensure_queue_empty(sqs, dlq_url, "DLQ")
+    ensure_queue_empty(sqs, dlq_url, "DLQ")
     print("[happy] PASS")
 
-    if previous_desired != 0:
-        print(f"[happy] Restoring service desiredCount to {previous_desired} ...")
-        update_service_desired(cluster, service, previous_desired)
 
-
-def scenario_crash(args: argparse.Namespace, env: Dict[str, str]) -> None:
-    """Scenario 2: Consumer crash mid-processing."""
-    queue_url = env["QUEUE_URL"]
-    region = env["AWS_REGION"]
-    profile = env.get("AWS_PROFILE", "")
-    dlq_url = queue_url_from_arn(env["DLQ_ARN"]) if env.get("DLQ_ARN") else None
+def scenario_crash(args: argparse.Namespace, outputs: Dict, main_outputs: Dict) -> None:
+    """Scenario 2: Consumer crash mid-processing, then redelivery."""
+    queue_url = outputs["queue_url"]
+    region = outputs["aws_region"]
+    profile = os.environ.get("AWS_PROFILE", "")
+    dlq_url = queue_url_from_arn(outputs["dlq_arn"])
     sqs = build_sqs_client(region, profile)
-    cluster = DEFAULT_ECS_CLUSTER
-    service = DEFAULT_ECS_SERVICE
-    container = DEFAULT_ECS_CONTAINER
 
-    print("[crash] Clearing queues before start ...")
-    purge_queue_if_needed(sqs, queue_url, "primary")
-    ensure_queue_empty(sqs, queue_url, "primary")
-    if dlq_url:
-        purge_queue_if_needed(sqs, dlq_url, "DLQ")
-        ensure_queue_empty(sqs, dlq_url, "DLQ")
+    cluster = outputs["cluster_name"]
+    task_definition = outputs["task_definition_arn"]
+    container = outputs["container_name"]
+    subnets = main_outputs["subnet_ids"]
+    security_groups = main_outputs["security_group_ids"]
 
     message_count = 1
     print(f"[crash] Sending {message_count} message ...")
     run_producer(message_count, batch_size=1, region=region, queue_url=queue_url, profile=profile)
     print("[crash] Confirming message is enqueued ...")
     wait_for_messages_enqueued(sqs, queue_url, message_count)
-
-    (
-        service_desc,
-        previous_desired,
-        subnets,
-        security_groups,
-        task_definition,
-    ) = describe_service_config(cluster, service)
-
-    if previous_desired != 0:
-        print(f"[crash] Scaling service {service} to 0 to avoid interference (was {previous_desired}) ...")
-        update_service_desired(cluster, service, 0)
 
     print("[crash] Running ECS task that will crash mid-processing ...")
     crash_task = run_ecs_task(
@@ -550,50 +460,29 @@ def scenario_crash(args: argparse.Namespace, env: Dict[str, str]) -> None:
     print("[crash] Waiting for queue to drain ...")
     wait_for_queue_empty(sqs, queue_url)
     ensure_queue_empty(sqs, queue_url, "primary")
-    if dlq_url:
-        ensure_queue_empty(sqs, dlq_url, "DLQ")
+    ensure_queue_empty(sqs, dlq_url, "DLQ")
     print("[crash] PASS")
 
-    if previous_desired != 0:
-        print(f"[crash] Restoring service desiredCount to {previous_desired} ...")
-        update_service_desired(cluster, service, previous_desired)
 
-
-def scenario_duplicates(args: argparse.Namespace, env: Dict[str, str]) -> None:
+def scenario_duplicates(args: argparse.Namespace, outputs: Dict, main_outputs: Dict) -> None:
     """Scenario 3: Duplicate delivery handled via idempotent side effects."""
-    queue_url = env["QUEUE_URL"]
-    region = env["AWS_REGION"]
-    profile = env.get("AWS_PROFILE", "")
-    status_table_name = env.get("MESSAGE_STATUS_TABLE")
-    completed_table_name = env.get("MESSAGE_COMPLETED_TABLE")
-    if not status_table_name or not completed_table_name:
-        raise RuntimeError(
-            "MESSAGE_STATUS_TABLE and MESSAGE_COMPLETED_TABLE must be set for duplicates scenario"
-        )
+    queue_url = outputs["queue_url"]
+    region = outputs["aws_region"]
+    profile = os.environ.get("AWS_PROFILE", "")
+    status_table_name = outputs["message_status_table"]
+    completed_table_name = outputs["message_completed_table"]
 
-    cluster = DEFAULT_ECS_CLUSTER
-    service = DEFAULT_ECS_SERVICE
-    container = DEFAULT_ECS_CONTAINER
+    cluster = outputs["cluster_name"]
+    task_definition = outputs["task_definition_arn"]
+    container = outputs["container_name"]
+    subnets = main_outputs["subnet_ids"]
+    security_groups = main_outputs["security_group_ids"]
 
-    dlq_url = queue_url_from_arn(env["DLQ_ARN"]) if env.get("DLQ_ARN") else None
+    dlq_url = queue_url_from_arn(outputs["dlq_arn"])
     sqs = build_sqs_client(region, profile)
     dynamo = build_dynamo_resource(region, profile)
     status_table = dynamo.Table(status_table_name)
     completed_table = dynamo.Table(completed_table_name)
-    (
-        service_desc,
-        previous_desired,
-        subnets,
-        security_groups,
-        task_definition,
-    ) = describe_service_config(cluster, service)
-
-    print("[dup] Clearing queues before start ...")
-    clear_queues(sqs, queue_url, dlq_url, "[dup]")
-    clear_dynamo_tables(dynamo, [status_table_name, completed_table_name], prefix="[dup]")
-
-    print(f"[dup] Scaling service {service} to 0 to avoid interference (was {previous_desired}) ...")
-    update_service_desired(cluster, service, 0)
 
     message_id = str(uuid.uuid4())
     payload = {"id": message_id, "work": "duplicate-demo"}
@@ -617,21 +506,11 @@ def scenario_duplicates(args: argparse.Namespace, env: Dict[str, str]) -> None:
 
     print("[dup] Starting two ECS tasks concurrently (long work > visibility timeout) ...")
     task1 = run_ecs_task(
-        cluster,
-        task_definition,
-        container,
-        subnets,
-        security_groups,
-        env=common_env,
+        cluster, task_definition, container, subnets, security_groups, env=common_env,
     )
     time.sleep(args.second_start_delay)
     task2 = run_ecs_task(
-        cluster,
-        task_definition,
-        container,
-        subnets,
-        security_groups,
-        env=common_env,
+        cluster, task_definition, container, subnets, security_groups, env=common_env,
     )
 
     task1_desc = wait_for_task_stop(cluster, task1, timeout=args.consumer_timeout)
@@ -643,15 +522,10 @@ def scenario_duplicates(args: argparse.Namespace, env: Dict[str, str]) -> None:
     if exit2 not in (0, None):
         raise RuntimeError(f"[dup] second task failed with exit code {exit2}")
 
-    if previous_desired != 0:
-        print(f"[dup] Restoring service desiredCount to {previous_desired} ...")
-        update_service_desired(cluster, service, previous_desired)
-
     print("[dup] Waiting for queue to drain ...")
     wait_for_queue_empty(sqs, queue_url, timeout=args.queue_timeout)
     ensure_queue_empty(sqs, queue_url, "primary")
-    if dlq_url:
-        ensure_queue_empty(sqs, dlq_url, "DLQ")
+    ensure_queue_empty(sqs, dlq_url, "DLQ")
 
     status_item = status_table.get_item(Key={"message_id": message_id}).get("Item")
     if not status_item:
@@ -672,8 +546,35 @@ def scenario_duplicates(args: argparse.Namespace, env: Dict[str, str]) -> None:
     )
 
 
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+
+def latest_ecr_tag(repo_url: str) -> str:
+    """Return the tag of the most recently pushed image in the ECR repo."""
+    repo_name = repo_url.split("/", 1)[-1]
+    region = repo_url.split(".")[3]
+    ecr = boto3.Session(region_name=region).client("ecr")
+    resp = ecr.describe_images(
+        repositoryName=repo_name,
+        filter={"tagStatus": "TAGGED"},
+    )
+    images = resp.get("imageDetails", [])
+    if not images:
+        raise SystemExit(f"No tagged images found in ECR repo {repo_name}")
+    newest = max(images, key=lambda i: i["imagePushedAt"])
+    tags = newest.get("imageTags", [])
+    if not tags:
+        raise SystemExit(f"Most recent image in {repo_name} has no tags")
+    return tags[0]
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run queue scenarios")
+    parser.add_argument(
+        "--image-tag", type=str, default=None, help="Container image tag (default: most recent)"
+    )
     subparsers = parser.add_subparsers(dest="scenario", required=True)
 
     happy = subparsers.add_parser("happy", help="Happy path scenario")
@@ -732,55 +633,31 @@ def parse_args() -> argparse.Namespace:
         help="Timeout (seconds) to wait for queue to drain",
     )
 
-    clean = subparsers.add_parser("clean", help="Reset state: purge queues and exit")
-    clean.add_argument(
-        "--consumer-timeout",
-        type=int,
-        default=90,
-        help="Timeout placeholder (kept for symmetry; not used currently)",
-    )
-
     return parser.parse_args()
-
-
-def scenario_clean(env: Dict[str, str]) -> None:
-    """Scenario 0: Clean queues to a known empty state."""
-    queue_url = env["QUEUE_URL"]
-    region = env["AWS_REGION"]
-    profile = env.get("AWS_PROFILE", "")
-    status_table = env.get("MESSAGE_STATUS_TABLE")
-    completed_table = env.get("MESSAGE_COMPLETED_TABLE")
-    dlq_url = queue_url_from_arn(env["DLQ_ARN"]) if env.get("DLQ_ARN") else None
-    sqs = build_sqs_client(region, profile)
-    dynamo_tables: list[str] = []
-    if status_table:
-        dynamo_tables.append(status_table)
-    if completed_table:
-        dynamo_tables.append(completed_table)
-
-    clear_queues(sqs, queue_url, dlq_url, "[clean]")
-    if dynamo_tables:
-        dynamo = build_dynamo_resource(region, profile)
-        clear_dynamo_tables(dynamo, dynamo_tables, prefix="[clean]")
-    print("[clean] PASS (queues empty)")
 
 
 def main() -> None:
     args = parse_args()
-    env = resolve_env()
-    if not env["QUEUE_URL"]:
-        raise SystemExit("QUEUE_URL is required (set env or .env)")
 
-    if args.scenario == "happy":
-        scenario_happy(args, env)
-    elif args.scenario == "crash":
-        scenario_crash(args, env)
-    elif args.scenario == "duplicates":
-        scenario_duplicates(args, env)
-    elif args.scenario == "clean":
-        scenario_clean(env)
-    else:
+    print("[main] Reading main terraform outputs ...")
+    main_outputs = get_main_tf_outputs()
+
+    ecr_repo_url = main_outputs["ecr_repository_url"]
+    image_tag = args.image_tag or latest_ecr_tag(ecr_repo_url)
+    container_image = f"{ecr_repo_url}:{image_tag}"
+    print(f"[main] Container image: {container_image}")
+
+    scenario_fn = {
+        "happy": scenario_happy,
+        "crash": scenario_crash,
+        "duplicates": scenario_duplicates,
+    }.get(args.scenario)
+
+    if not scenario_fn:
         raise SystemExit(f"Unknown scenario {args.scenario}")
+
+    with scenario_infra(args.scenario, container_image, main_outputs) as outputs:
+        scenario_fn(args, outputs, main_outputs)
 
 
 if __name__ == "__main__":

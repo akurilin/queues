@@ -42,3 +42,18 @@ output "message_completed_table" {
   value       = aws_dynamodb_table.message_completed.name
   description = "DynamoDB table for completion idempotency"
 }
+
+output "subnet_ids" {
+  value       = module.vpc.public_subnets
+  description = "Public subnet IDs from the VPC"
+}
+
+output "security_group_ids" {
+  value       = [aws_security_group.tasks.id]
+  description = "Security group IDs for ECS tasks"
+}
+
+output "execution_role_arn" {
+  value       = aws_iam_role.execution.arn
+  description = "ECS task execution role ARN"
+}
