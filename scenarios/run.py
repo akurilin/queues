@@ -56,6 +56,34 @@ def read_terraform_outputs() -> Dict:
 # ---------------------------------------------------------------------------
 # AWS helpers
 # ---------------------------------------------------------------------------
+#
+# SQS behavioral quirks that affect this test harness
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#
+# 1. PurgeQueue has a 60-second danger window.
+#    The API returns immediately but deletion continues asynchronously for up
+#    to 60 seconds.  Messages sent *after* the PurgeQueue call can be silently
+#    deleted if they arrive while the purge is still running.  This corrupts
+#    the ApproximateNumberOfMessages counter in unpredictable ways — we saw it
+#    report the full sent count (e.g. 5) on a queue that was genuinely empty.
+#
+#    Fix: purge_queue() checks depth first and skips the call when the queue
+#    is already empty.  cleanup_scenario_state() waits the full 60 seconds
+#    when a purge was actually issued, so new messages are never sent into
+#    an active purge window.
+#
+# 2. ApproximateNumberOfMessages is *approximate*.
+#    SQS queue attributes are eventually consistent.  A single-shot read can
+#    return a stale non-zero count even when the queue is genuinely empty,
+#    especially right after message operations.  We observed this causing
+#    false failures when a single ensure_queue_empty() check ran immediately
+#    after wait_for_queue_empty() had already confirmed 3 consecutive zeros.
+#
+#    Fix: we rely on wait_for_queue_empty() (multiple consecutive zero
+#    readings) as the authoritative "queue is drained" signal for the primary
+#    queue.  We only use the single-shot ensure_queue_empty() on the DLQ,
+#    where no recent message operations have occurred and the counter is
+#    stable.
 
 
 def build_sqs_client(region: str, profile: Optional[str]) -> BaseClient:
@@ -94,8 +122,17 @@ def queue_url_from_arn(arn: str) -> str:
     return f"https://sqs.{region}.amazonaws.com/{account_id}/{queue_name}"
 
 
-def purge_queue(sqs: BaseClient, queue_url: str, label: str) -> None:
-    """Purge all messages from a queue. Silently ignores 'already purged' errors."""
+def purge_queue(sqs: BaseClient, queue_url: str, label: str) -> bool:
+    """Purge all messages from a queue if it is non-empty.
+
+    Skips the call when the queue is already empty to avoid the 60-second
+    purge window that can interfere with newly sent messages (see quirk #1
+    above).  Returns True if a purge was issued, False if skipped.
+    """
+    depth = get_queue_depth(sqs, queue_url)
+    if depth["visible"] == 0 and depth["not_visible"] == 0:
+        print(f"[purge] {label} queue already empty, skipping purge")
+        return False
     try:
         sqs.purge_queue(QueueUrl=queue_url)
         print(f"[purge] Purged {label} queue {queue_url}")
@@ -105,12 +142,56 @@ def purge_queue(sqs: BaseClient, queue_url: str, label: str) -> None:
             print(f"[purge] {label} queue purge already in progress")
         else:
             raise
-    # SQS purge is async — give it a moment to take effect
-    time.sleep(3)
+    return True
+
+
+def clear_dynamo_table(dynamo_resource, table_name: str) -> None:
+    """Scan a DynamoDB table and batch-delete all items (no truncate API)."""
+    table = dynamo_resource.Table(table_name)
+    key_names = [k["AttributeName"] for k in table.key_schema]
+    scan_kwargs = {"ProjectionExpression": ", ".join(key_names)}
+    while True:
+        response = table.scan(**scan_kwargs)
+        items = response.get("Items", [])
+        if not items:
+            break
+        with table.batch_writer() as batch:
+            for item in items:
+                batch.delete_item(Key={k: item[k] for k in key_names})
+        if not response.get("LastEvaluatedKey"):
+            break
+        scan_kwargs["ExclusiveStartKey"] = response["LastEvaluatedKey"]
+    print(f"[cleanup] Cleared DynamoDB table {table_name}")
+
+
+def cleanup_scenario_state(
+    sqs: BaseClient, dynamo_resource, outputs: Dict, label: str
+) -> None:
+    """Purge SQS queues and clear DynamoDB tables for a clean scenario start.
+
+    When a purge is issued, waits the full 60 seconds for it to complete
+    before returning so callers can safely send new messages (see quirk #1).
+    """
+    print(f"[{label}] Cleaning up previous state ...")
+    queue_url = outputs["queue_url"]
+    dlq_url = queue_url_from_arn(outputs["dlq_arn"])
+    purged_primary = purge_queue(sqs, queue_url, "primary")
+    purged_dlq = purge_queue(sqs, dlq_url, "DLQ")
+    clear_dynamo_table(dynamo_resource, outputs["message_status_table"])
+    clear_dynamo_table(dynamo_resource, outputs["message_completed_table"])
+    if purged_primary or purged_dlq:
+        print(f"[{label}] Waiting 60s for SQS purge to complete ...")
+        time.sleep(60)
 
 
 def ensure_queue_empty(sqs: BaseClient, queue_url: str, label: str) -> None:
-    """Verify a queue has no visible or in-flight messages."""
+    """Single-shot assertion that a queue is empty.
+
+    Only suitable for queues with no recent message operations (e.g. the DLQ
+    after the primary queue has drained).  Do not use on a queue that was just
+    actively consumed — the approximate counters can briefly show stale
+    non-zero values (see quirk #2 above).  Use wait_for_queue_empty() instead.
+    """
     depth = get_queue_depth(sqs, queue_url)
     if depth["visible"] != 0 or depth["not_visible"] != 0:
         raise RuntimeError(
@@ -236,6 +317,8 @@ def scenario_happy(args: argparse.Namespace, outputs: Dict) -> None:
     profile = os.environ.get("AWS_PROFILE", "")
     dlq_url = queue_url_from_arn(outputs["dlq_arn"])
     sqs = build_sqs_client(region, profile)
+    dynamo = build_dynamo_resource(region, profile)
+    cleanup_scenario_state(sqs, dynamo, outputs, "happy")
 
     message_count = args.count or 5
     batch_size = min(args.batch_size or 5, 10)
@@ -261,7 +344,6 @@ def scenario_happy(args: argparse.Namespace, outputs: Dict) -> None:
 
     print("[happy] Waiting for queue to drain ...")
     wait_for_queue_empty(sqs, queue_url)
-    ensure_queue_empty(sqs, queue_url, "primary")
     ensure_queue_empty(sqs, dlq_url, "DLQ")
     print("[happy] PASS")
 
@@ -273,6 +355,8 @@ def scenario_crash(args: argparse.Namespace, outputs: Dict) -> None:
     profile = os.environ.get("AWS_PROFILE", "")
     dlq_url = queue_url_from_arn(outputs["dlq_arn"])
     sqs = build_sqs_client(region, profile)
+    dynamo = build_dynamo_resource(region, profile)
+    cleanup_scenario_state(sqs, dynamo, outputs, "crash")
 
     message_count = 1
     print(f"[crash] Sending {message_count} message ...")
@@ -315,7 +399,6 @@ def scenario_crash(args: argparse.Namespace, outputs: Dict) -> None:
 
     print("[crash] Waiting for queue to drain ...")
     wait_for_queue_empty(sqs, queue_url)
-    ensure_queue_empty(sqs, queue_url, "primary")
     ensure_queue_empty(sqs, dlq_url, "DLQ")
     print("[crash] PASS")
 
@@ -331,6 +414,7 @@ def scenario_duplicates(args: argparse.Namespace, outputs: Dict) -> None:
     dlq_url = queue_url_from_arn(outputs["dlq_arn"])
     sqs = build_sqs_client(region, profile)
     dynamo = build_dynamo_resource(region, profile)
+    cleanup_scenario_state(sqs, dynamo, outputs, "dup")
     status_table = dynamo.Table(status_table_name)
     completed_table = dynamo.Table(completed_table_name)
 
@@ -368,7 +452,6 @@ def scenario_duplicates(args: argparse.Namespace, outputs: Dict) -> None:
 
     print("[dup] Waiting for queue to drain ...")
     wait_for_queue_empty(sqs, queue_url, timeout=args.queue_timeout)
-    ensure_queue_empty(sqs, queue_url, "primary")
     ensure_queue_empty(sqs, dlq_url, "DLQ")
 
     status_item = status_table.get_item(Key={"message_id": message_id}).get("Item")
@@ -397,10 +480,8 @@ def scenario_poison(args: argparse.Namespace, outputs: Dict) -> None:
     profile = os.environ.get("AWS_PROFILE", "")
     dlq_url = queue_url_from_arn(outputs["dlq_arn"])
     sqs = build_sqs_client(region, profile)
-
-    print("[poison] Purging queues to start clean ...")
-    purge_queue(sqs, queue_url, "primary")
-    purge_queue(sqs, dlq_url, "DLQ")
+    dynamo = build_dynamo_resource(region, profile)
+    cleanup_scenario_state(sqs, dynamo, outputs, "poison")
 
     total_count = args.count
     poison_count = args.poison_count
@@ -438,7 +519,6 @@ def scenario_poison(args: argparse.Namespace, outputs: Dict) -> None:
 
     print("[poison] Waiting for main queue to fully drain ...")
     wait_for_queue_empty(sqs, queue_url, timeout=args.queue_timeout)
-    ensure_queue_empty(sqs, queue_url, "primary")
 
     print("[poison] Checking DLQ for poison messages ...")
     dlq_depth = get_queue_depth(sqs, dlq_url)
