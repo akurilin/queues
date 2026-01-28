@@ -1,57 +1,36 @@
 # SQS Demo
 
-Minimal-but-complete SQS workflow. Entirely vibe-coded. Terraform creates:
-- VPC (public subnets only, no NAT gateway)
-- SQS standard queue + dead-letter queue (DLQ)
-- ECR repo for the consumer image
-- ECS Fargate cluster/service/task for the consumer
-- CloudWatch log group
-- Two DynamoDB tables (`message-status`, `message-completed`) for idempotency and per-message state tracking
-- IAM roles (execution role for ECR pull + CloudWatch, task role for SQS + DynamoDB)
+Minimal-but-complete SQS workflow. Entirely vibe-coded. Terraform creates per-scenario resources:
+- SQS standard queue + dead-letter queue (DLQ) for each of 5 scenarios
+- Two DynamoDB tables per scenario (`message-status`, `message-completed`) for idempotency and per-message state tracking
+
+Consumers and producers both run locally (no ECS/Fargate/Docker needed).
 
 ## Repo layout
 
 | Directory | Purpose |
 |-----------|---------|
-| `consumer/` | Python SQS consumer (Dockerized, Python 3.14-slim) with chaos/failure knobs |
+| `consumer/` | Python SQS consumer with chaos/failure knobs |
 | `producer/` | Local Python script to enqueue synthetic messages with batching and rate limiting |
 | `scripts/` | Build/push helper (`build_and_push.sh`), producer wrapper (`run_producer.sh`), env loader (`set_env.sh`) |
 | `terraform/` | Infrastructure definitions with local state |
-| `scenarios/` | Self-contained runnable scenarios: happy path, crash recovery, duplicate processing |
+| `scenarios/` | 5 self-contained runnable scenarios exercising queue behaviors |
 | `plans/` | Planning/design documents |
 
 ## Prerequisites
-- AWS CLI configured with a profile that can create VPC/ECR/ECS/SQS/DynamoDB resources
+- AWS CLI configured with a profile that can create SQS/DynamoDB resources
 - Terraform >= 1.5
-- Docker (can build for amd64; script defaults to `--platform linux/amd64`)
-- Python 3.11+ for the producer and scenario scripts
+- Python 3.11+
 
 ## How to use this repo end-to-end
 
-1) **(Optional) load env helpers**
-   `source ./scripts/set_env.sh`
-
-2) **Provision infrastructure** (local Terraform state in `terraform/`)
+1) **Provision infrastructure** (local Terraform state in `terraform/`)
    ```bash
-   terraform -chdir=terraform init
-   terraform -chdir=terraform apply -auto-approve
+   make infra-up
    ```
-   This writes a `.env` at repo root with `QUEUE_URL`, `DLQ_ARN`, `ECR_REPO`, `AWS_REGION`, `MESSAGE_STATUS_TABLE`, and `MESSAGE_COMPLETED_TABLE`.
+   This writes a `.env` at repo root with `QUEUE_URL`, `DLQ_ARN`, `AWS_REGION`, `MESSAGE_STATUS_TABLE`, and `MESSAGE_COMPLETED_TABLE` (pointing at the happy-path resources for ad-hoc testing).
 
-3) **Build and push the consumer image**
-   ```bash
-   ./scripts/build_and_push.sh
-   ```
-   - Defaults `IMAGE_TAG` to the current git SHA (appends `-dirty-<timestamp>` if the tree is dirty). Override by exporting `IMAGE_TAG=...` if you want a custom tag.
-   - Uses `ECR_REPO` from `.env` or Terraform output.
-   - Builds for amd64 by default (`PLATFORM=linux/amd64`), so Fargate can run it.
-
-4) **Point ECS at the pushed tag (if not `latest`)**
-   ```bash
-   terraform -chdir=terraform apply -auto-approve -var container_image_tag=${IMAGE_TAG:-$(git rev-parse --short HEAD)}
-   ```
-
-5) **Run the producer locally to send messages**
+2) **Run the producer locally to send messages**
    ```bash
    ./scripts/run_producer.sh --n 25 --rate 5
    ```
@@ -66,29 +45,37 @@ Minimal-but-complete SQS workflow. Entirely vibe-coded. Terraform creates:
    python produce.py --n 25 --rate 5 --queue-url "$QUEUE_URL"
    ```
 
-6) **Watch the consumer**
-   - Logs: `aws logs tail /aws/ecs/sqs-demo-consumer --follow`
-   - ECS service: `aws ecs describe-services --cluster sqs-demo-cluster --services sqs-demo-service`
-   - Scale: `terraform -chdir=terraform apply -auto-approve -var desired_count=3`
-
-7) **Tear down**
+3) **Run a consumer locally**
    ```bash
-   terraform -chdir=terraform destroy -auto-approve
+   source .env
+   cd consumer
+   python -m venv .venv && source .venv/bin/activate
+   pip install -r requirements.txt
+   python consume.py
+   ```
+
+4) **Run scenarios** (see [Scenarios](#scenarios) below)
+   ```bash
+   make scenario-happy
+   ```
+
+5) **Tear down**
+   ```bash
+   make infra-down
    ```
 
 ## Architecture
 
 ```
-Producer (local)  ──▶  SQS Queue  ──▶  Consumer (ECS Fargate)  ──▶  DynamoDB (status + completed)
+Producer (local)  ──▶  SQS Queue  ──▶  Consumer (local)  ──▶  DynamoDB (status + completed)
                           │
                           ▼
-                     Dead-Letter Queue (after 5 failed receives)
+                     Dead-Letter Queue (after 2 failed receives)
 ```
 
 - **Idempotency**: DynamoDB tables track message IDs. The `message-status` table records processing state (STARTED/COMPLETED) with attempt counts. The `message-completed` table provides a separate completion record for cross-consumer deduplication. The consumer also maintains an in-memory LRU cache for fast local duplicate detection.
 - **Long-polling**: Consumer uses configurable wait time (default 10s) to reduce API calls.
 - **Batching**: Producer batches up to 10 messages per SQS API call.
-- **Scalability**: ECS service can scale horizontally (configurable `desired_count`, default 1).
 
 ## What the consumer does
 - Long-polls SQS, parses JSON payloads, tracks state in DynamoDB, deletes messages after processing.
@@ -112,6 +99,7 @@ Producer (local)  ──▶  SQS Queue  ──▶  Consumer (ECS Fargate)  ─�
 | `IDEMPOTENCY_CACHE_SIZE` | `1000` | In-memory LRU cache size for duplicate detection (0 = disabled) |
 | `MESSAGE_LIMIT` | `0` | Stop after processing N messages (0 = unlimited) |
 | `IDLE_TIMEOUT_SECONDS` | `0` | Exit if no messages arrive for this many seconds (0 = disabled) |
+| `REJECT_PAYLOAD_MARKER` | *(empty)* | Reject messages whose payload contains this marker (for poison message testing) |
 | `MESSAGE_STATUS_TABLE` | *(optional)* | DynamoDB table name for status tracking |
 | `MESSAGE_COMPLETED_TABLE` | *(optional)* | DynamoDB table name for completion idempotency |
 | `LOG_LEVEL` | `INFO` | Logging level (DEBUG, INFO, WARNING, ERROR) |
@@ -123,22 +111,21 @@ Producer (local)  ──▶  SQS Queue  ──▶  Consumer (ECS Fargate)  ─�
 - `--n` — number of messages to send (default 10)
 - `--rate` — messages/sec limit (`0` = as fast as possible)
 - `--batch-size` — messages per SQS batch call (max 10, default 10)
+- `--poison-count` — number of poison messages to inject (default 0)
 - `--queue-url` — override queue URL (defaults to `QUEUE_URL` env var)
 - `--region` — AWS region (defaults to `AWS_REGION` env var)
 - `--profile` — AWS profile (defaults to `AWS_PROFILE` env var)
 
-Each message contains a JSON payload with a UUID `id` and a random `work` value (1–1000).
+Each message contains a JSON payload with a UUID `id` and a random `work` value (1–1000). Poison messages additionally carry `"poison": true`.
 
 ## Failure-mode experiments
 - **Visibility overrun**: `LONG_SLEEP_SECONDS=10 LONG_SLEEP_EVERY=2` — expect duplicates as messages become visible again before processing completes
-- **Crashy worker**: `CRASH_RATE=0.2` — container exits intermittently; ECS restarts the task, messages redeliver
+- **Crashy worker**: `CRASH_RATE=0.2` — consumer exits intermittently; messages redeliver from the queue
 - **Deterministic crash**: `CRASH_AFTER_RECEIVE=1` — crashes after processing but before delete, useful for testing redelivery
-- **Scale out**: `terraform -chdir=terraform apply -auto-approve -var desired_count=3` — watch backlog drain across multiple consumers
 - **Burst load**: `./scripts/run_producer.sh --n 1000 --rate 0` — observe SQS metrics and processing throughput
-- **Kill task mid-run**: terminate the ECS task from the console while processing — message should reappear (not yet deleted)
 
 ## Environment config
-- Terraform writes a `.env` at repo root with `QUEUE_URL`, `DLQ_ARN`, `ECR_REPO`, `AWS_REGION`, `MESSAGE_STATUS_TABLE`, and `MESSAGE_COMPLETED_TABLE`. Optional: `AWS_PROFILE`, `IMAGE_TAG`.
+- Terraform writes a `.env` at repo root with `QUEUE_URL`, `DLQ_ARN`, `AWS_REGION`, `MESSAGE_STATUS_TABLE`, and `MESSAGE_COMPLETED_TABLE` (using the happy-path scenario resources).
 - If you prefer manual setup, copy `.env.example` to `.env` and fill in your account-specific values; scripts/loaders will pick it up.
 
 ## Terraform variables
@@ -147,53 +134,57 @@ Each message contains a JSON payload with a UUID `id` and a random `work` value 
 |----------|---------|-------------|
 | `aws_region` | `us-west-1` | AWS region for all resources |
 | `project_name` | `sqs-demo` | Base name for created resources |
-| `vpc_cidr` | `10.0.0.0/20` | CIDR block for the demo VPC |
-| `desired_count` | `1` | Number of consumer ECS tasks |
-| `container_cpu` | `256` | CPU units for the consumer task |
-| `container_memory` | `512` | Memory (MB) for the consumer task |
-| `container_image_tag` | `latest` | Image tag to deploy |
 | `queue_visibility_timeout` | `10` | SQS visibility timeout (seconds) |
 | `queue_receive_wait` | `10` | SQS long-poll wait time (seconds) |
-| `log_retention_days` | `14` | CloudWatch log retention (days) |
 
 ## Scenarios
-`scenarios/` contains self-contained setups to exercise typical queue behaviors. Each scenario provisions its own isolated infrastructure (SQS queue + DLQ, DynamoDB tables, ECS cluster + task definition, task IAM role) via `scenarios/terraform/`, runs the test, and tears everything down afterwards. Shared resources (VPC, execution role, CloudWatch, ECR) come from the main terraform.
+`scenarios/` contains self-contained setups to exercise typical queue behaviors. Each scenario uses its own isolated SQS queue + DLQ and DynamoDB tables, all provisioned by the shared `terraform/` configuration. Consumers and producers run as local Python subprocesses.
 
-- **Happy path**: messages flow through cleanly, all processed and deleted.
-- **Crashed consumer**: observe redelivery and recovery after worker crashes.
-- **Duplicate message processing**: see how DynamoDB-backed idempotency handles redelivered messages.
+- **Happy path** (`make scenario-happy`): messages flow through cleanly, all processed and deleted.
+- **Crash recovery** (`make scenario-crash`): consumer crashes after receiving; observe redelivery and recovery.
+- **Duplicate delivery** (`make scenario-duplicates`): slow processing triggers visibility timeout, causing redelivery; DynamoDB-backed idempotency prevents duplicate side effects.
+- **Poison messages** (`make scenario-poison`): messages with a poison marker are rejected and redrive to the DLQ after max retries.
+- **Backpressure / auto-scaling** (`make scenario-backpressure`): a continuous producer floods the queue; the runner monitors queue depth and spawns additional consumers until equilibrium.
 
 ### Running scenarios
-- **Prereqs**: main infra provisioned (`terraform -chdir=terraform apply`), consumer image pushed to ECR, AWS CLI + Terraform on PATH.
-- **One-time setup**:
+- **Prereqs**: infrastructure provisioned (`make infra-up`), AWS CLI + Terraform on PATH.
+- **Quick start** (venv is created automatically):
   ```bash
-  python -m venv scenarios/.venv && source scenarios/.venv/bin/activate
-  pip install -r scenarios/requirements.txt
+  make scenario-happy
+  make scenario-crash
+  make scenario-duplicates
+  make scenario-poison
+  make scenario-backpressure
   ```
-- **Run from repo root** with the venv active:
+- **Run all at once**:
   ```bash
-  python scenarios/run.py happy --count 5 --batch-size 5
-  python scenarios/run.py crash --visibility-wait 15
-  python scenarios/run.py duplicates --slow-seconds 30 --second-start-delay 0
+  make scenarios
   ```
-- Use `--image-tag <tag>` to specify a container image tag (default: `latest`).
-- Each run creates a Terraform workspace, provisions per-scenario resources, validates them, runs the scenario, then destroys everything.
+- Pass extra arguments via `ARGS`:
+  ```bash
+  make scenario-happy ARGS="--count 10 --batch-size 5"
+  ```
 
 ### Validating infrastructure
-You can validate infrastructure independently:
 ```bash
-# Validate shared (main) infrastructure
-python scenarios/validate_infra.py --main
-
-# Validate a specific scenario workspace
-python scenarios/validate_infra.py --workspace happy-a1b2c3d4
+make validate
 ```
+
+## Makefile targets
+
+Run `make help` to see all targets. Key ones:
+
+| Target | Purpose |
+|--------|---------|
+| `make preflight` | Check local environment for required tools |
+| `make infra-up` | Provision infrastructure |
+| `make infra-down` | Destroy infrastructure |
+| `make venv` | Create/update the project venv |
+| `make validate` | Validate scenario infrastructure is healthy |
+| `make scenario-*` | Run individual scenarios |
+| `make scenarios` | Run all 5 scenarios sequentially |
 
 ## Tear down
 ```bash
-terraform -chdir=terraform destroy -auto-approve
+make infra-down
 ```
-
-## WIP
-- Moving testing scenarios to a local environment would be a real time saver, although would lose true e2e test value
-- A few more scenarios to implement
