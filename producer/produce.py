@@ -118,10 +118,11 @@ def main() -> None:
     # Create an SQS client using the specified AWS region and profile
     sqs: BaseClient = build_sqs_client(args.region, args.profile)
 
-    # Ensure total message count is non-negative (prevent negative values from args)
+    # total=0 means "run forever until interrupted"
     total = max(args.n, 0)
-    # Compute global indices for poison messages
-    poison_count = max(0, min(args.poison_count, total))
+    continuous = total == 0
+    # Compute global indices for poison messages (only for finite runs)
+    poison_count = max(0, min(args.poison_count, total)) if not continuous else 0
     poison_indices: set[int] = set(random.sample(range(total), poison_count)) if poison_count else set()
     if poison_count:
         logging.info("Poison messages (%s) at indices: %s", poison_count, sorted(poison_indices))
@@ -133,9 +134,10 @@ def main() -> None:
     start_time = time.time()
 
     # Log initial configuration so user knows what the script will do
+    count_label = "∞ (continuous)" if continuous else str(total)
     logging.info(
         "Sending %s messages to %s (batch=%s rate=%s/sec)",
-        total,
+        count_label,
         args.queue_url,
         batch_size,
         args.rate,
@@ -143,44 +145,51 @@ def main() -> None:
 
     # Initialize counter to track which message we're on (for batch entry IDs)
     message_index = 0
-    # Loop until we've sent all requested messages
-    while message_index < total:
-        # Calculate how many messages to send in this batch (may be smaller at the end)
-        chunk = min(batch_size, total - message_index)
-        # Generate the batch of message entries with unique IDs and payloads
-        entries = make_entries(message_index, chunk, poison_indices)
-        # Send the batch to SQS and get response (may contain failures)
-        response: dict[str, Any] = sqs.send_message_batch(
-            QueueUrl=args.queue_url, Entries=entries
-        )
+    # Loop until we've sent all requested messages (or forever if continuous)
+    try:
+        while continuous or message_index < total:
+            # Calculate how many messages to send in this batch
+            if continuous:
+                chunk = batch_size
+            else:
+                chunk = min(batch_size, total - message_index)
+            # Generate the batch of message entries with unique IDs and payloads
+            entries = make_entries(message_index, chunk, poison_indices)
+            # Send the batch to SQS and get response (may contain failures)
+            response: dict[str, Any] = sqs.send_message_batch(
+                QueueUrl=args.queue_url, Entries=entries
+            )
 
-        # Extract any failed entries from the SQS response (empty list if all succeeded)
-        failed_entries = response.get("Failed", [])
-        # Count how many messages failed in this batch
-        batch_failed = len(failed_entries)
-        # Calculate successful sends by subtracting failures from attempted sends
-        batch_sent = chunk - batch_failed
+            # Extract any failed entries from the SQS response (empty list if all succeeded)
+            failed_entries = response.get("Failed", [])
+            # Count how many messages failed in this batch
+            batch_failed = len(failed_entries)
+            # Calculate successful sends by subtracting failures from attempted sends
+            batch_sent = chunk - batch_failed
 
-        # Accumulate successful sends across all batches
-        sent += batch_sent
-        # Accumulate failures across all batches
-        failed += batch_failed
+            # Accumulate successful sends across all batches
+            sent += batch_sent
+            # Accumulate failures across all batches
+            failed += batch_failed
 
-        # Log warnings for any failures so user can see what went wrong
-        if batch_failed:
-            logging.warning("%s messages failed: %s", batch_failed, failed_entries)
+            # Log warnings for any failures so user can see what went wrong
+            if batch_failed:
+                logging.warning("%s messages failed: %s", batch_failed, failed_entries)
 
-        # Advance the index by the chunk size to process next batch
-        message_index += chunk
-        # Report batch progress so caller can see how far along we are.
-        logging.info(
-            "Progress: sent %s/%s (failed=%s this batch)",
-            sent,
-            total,
-            batch_failed,
-        )
-        # Throttle if needed to maintain the target send rate (rate limiting)
-        maybe_throttle(start_time, sent, args.rate)
+            # Advance the index by the chunk size to process next batch
+            message_index += chunk
+            # Report batch progress so caller can see how far along we are.
+            target_label = "∞" if continuous else str(total)
+            logging.info(
+                "Progress: sent %s/%s (failed=%s this batch)",
+                sent,
+                target_label,
+                batch_failed,
+            )
+            # Throttle if needed to maintain the target send rate (rate limiting)
+            maybe_throttle(start_time, sent, args.rate)
+    except KeyboardInterrupt:
+        logging.info("Interrupted, stopping producer")
 
     # Calculate total elapsed time (use small epsilon to prevent division by zero)
     elapsed = max(time.time() - start_time, 0.0001)

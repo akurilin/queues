@@ -5,7 +5,8 @@ locals {
     happy  = "${local.name}-happy"
     crash  = "${local.name}-crash"
     dup    = "${local.name}-dup"
-    poison = "${local.name}-poison"
+    poison       = "${local.name}-poison"
+    backpressure = "${local.name}-backpressure"
   }
 
   env_file_path = "${path.module}/../.env"

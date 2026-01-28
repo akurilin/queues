@@ -29,6 +29,7 @@ SCENARIO_TF_KEYS = {
     "crash": "crash",
     "duplicates": "dup",
     "poison": "poison",
+    "backpressure": "backpressure",
 }
 
 
@@ -262,19 +263,65 @@ def run_local_consumer(env: Dict[str, str], timeout: int) -> int:
     return result.returncode
 
 
-def run_local_consumer_async(env: Dict[str, str]) -> subprocess.Popen:
+def run_local_consumer_async(
+    env: Dict[str, str], quiet: bool = False
+) -> subprocess.Popen:
     """Start consume.py as a background subprocess. Returns the Popen handle."""
     full_env = {**os.environ, **env}
-    print(f"[consumer] Starting {CONSUME_SCRIPT} in background ...")
+    if not quiet:
+        print(f"[consumer] Starting {CONSUME_SCRIPT} in background ...")
+    kwargs: Dict = {}
+    if quiet:
+        kwargs["stdout"] = subprocess.DEVNULL
+        kwargs["stderr"] = subprocess.DEVNULL
     return subprocess.Popen(
         [sys.executable, str(CONSUME_SCRIPT)],
         env=full_env,
+        **kwargs,
     )
 
 
 # ---------------------------------------------------------------------------
 # Producer helper
 # ---------------------------------------------------------------------------
+
+
+def run_producer_async(
+    count: int,
+    batch_size: int,
+    region: str,
+    queue_url: str,
+    profile: str,
+    rate: Optional[int] = None,
+    poison_count: int = 0,
+    quiet: bool = False,
+) -> subprocess.Popen:
+    """Start the producer script as a background subprocess. Returns the Popen handle."""
+    cmd = [
+        sys.executable,
+        str(REPO_ROOT / "producer" / "produce.py"),
+        "--queue-url",
+        queue_url,
+        "--region",
+        region,
+        "--n",
+        str(count),
+        "--batch-size",
+        str(batch_size),
+    ]
+    if rate is not None:
+        cmd.extend(["--rate", str(rate)])
+    if poison_count > 0:
+        cmd.extend(["--poison-count", str(poison_count)])
+    if profile:
+        cmd.extend(["--profile", profile])
+    if not quiet:
+        print(f"[producer] Starting producer in background (n={count}, rate={rate}) ...")
+    kwargs: Dict = {}
+    if quiet:
+        kwargs["stdout"] = subprocess.DEVNULL
+        kwargs["stderr"] = subprocess.DEVNULL
+    return subprocess.Popen(cmd, **kwargs)
 
 
 def run_producer(
@@ -532,6 +579,185 @@ def scenario_poison(args: argparse.Namespace, outputs: Dict) -> None:
     print(f"[poison] PASS | good={good_count} processed, poison={poison_count} in DLQ")
 
 
+def scenario_backpressure(args: argparse.Namespace, outputs: Dict) -> None:
+    """Scenario 5: Backpressure — auto-scale consumers when a continuous
+    producer overwhelms them, then confirm equilibrium and drain.
+
+    The producer runs continuously at a fixed rate (default 5 msgs/sec).
+    The runner starts with one slow consumer (~1 msg/sec) and monitors the
+    consumption rate via DynamoDB.  When consumers can't keep up it spawns
+    more.  Once the consumption rate meets or exceeds the production rate
+    for several consecutive ticks the runner declares equilibrium, stops the
+    producer, and lets the queue drain.
+    """
+    queue_url = outputs["queue_url"]
+    region = outputs["aws_region"]
+    profile = os.environ.get("AWS_PROFILE", "")
+    dlq_url = queue_url_from_arn(outputs["dlq_arn"])
+    status_table_name = outputs["message_status_table"]
+    completed_table_name = outputs["message_completed_table"]
+    sqs = build_sqs_client(region, profile)
+    dynamo = build_dynamo_resource(region, profile)
+    cleanup_scenario_state(sqs, dynamo, outputs, "backpressure")
+
+    prod_rate = args.rate
+    batch_size = args.batch_size
+    poll_interval = args.poll_interval
+
+    consumer_env_base = {
+        "QUEUE_URL": queue_url,
+        "AWS_REGION": region,
+        "MESSAGE_STATUS_TABLE": status_table_name,
+        "MESSAGE_COMPLETED_TABLE": completed_table_name,
+        "SLEEP_MIN_SECONDS": "1.0",
+        "SLEEP_MAX_SECONDS": "1.0",
+        "IDLE_TIMEOUT_SECONDS": str(args.idle_timeout),
+        "LOG_LEVEL": "WARNING",
+        "MAX_MESSAGES": "1",
+        "WAIT_TIME_SECONDS": "5",
+    }
+
+    # Phase 1: Start continuous producer and first consumer
+    print(f"[backpressure] Starting continuous producer at {prod_rate} msgs/sec ...")
+    producer_proc = run_producer_async(
+        count=0,  # 0 = run forever until killed
+        batch_size=batch_size,
+        region=region,
+        queue_url=queue_url,
+        profile=profile,
+        rate=prod_rate,
+        quiet=True,
+    )
+
+    print("[backpressure] Starting initial consumer ...")
+    consumers: list[subprocess.Popen] = [
+        run_local_consumer_async(consumer_env_base, quiet=True)
+    ]
+    peak_consumers = 1
+    completed_table = dynamo.Table(completed_table_name)
+
+    def _count_completed() -> int:
+        """Return the exact number of completed messages from DynamoDB."""
+        count = 0
+        scan_kw: Dict = {"Select": "COUNT"}
+        while True:
+            resp = completed_table.scan(**scan_kw)
+            count += resp["Count"]
+            if "LastEvaluatedKey" not in resp:
+                break
+            scan_kw["ExclusiveStartKey"] = resp["LastEvaluatedKey"]
+        return count
+
+    # Phase 2: Monitor & scale loop
+    # Compare consumption rate against production rate each tick.
+    # Scale up when falling behind; once queue depth drops to single
+    # digits for *equilibrium_ticks* consecutive ticks, stop the producer.
+    prev_completed = 0
+    eq_streak = 0
+    equilibrium_ticks = 3
+
+    while True:
+        time.sleep(poll_interval)
+
+        completed = _count_completed()
+        completed_delta = completed - prev_completed
+        consume_rate = completed_delta / poll_interval
+        prev_completed = completed
+
+        producer_alive = producer_proc.poll() is None
+
+        # Reap finished consumers
+        active_consumers = [p for p in consumers if p.poll() is None]
+
+        status = "producing" if producer_alive else "draining"
+
+        depth = get_queue_depth(sqs, queue_url)
+        queue_depth = depth["visible"]
+
+        print(
+            f"[backpressure] {status} | "
+            f"depth={queue_depth} completed={completed} "
+            f"rate={consume_rate:.1f}/s consumers={len(active_consumers)}"
+        )
+
+        if producer_alive:
+            # Stop producer once queue depth drops to single digits —
+            # consumers have caught up with the continuous inflow.
+            if queue_depth < 10 and completed > 0:
+                eq_streak += 1
+                if eq_streak >= equilibrium_ticks:
+                    print(
+                        f"[backpressure] Queue depth in single digits "
+                        f"(depth={queue_depth}) for {equilibrium_ticks} ticks "
+                        f"— stopping producer"
+                    )
+                    producer_proc.terminate()
+                    producer_proc.wait(timeout=10)
+                    continue
+            else:
+                eq_streak = 0
+
+            # Keep spawning consumers as long as depth >= 10 — don't
+            # stop just because the rate caught up; actively drive the
+            # backlog down.
+            if queue_depth >= 10:
+                new_proc = run_local_consumer_async(consumer_env_base, quiet=True)
+                consumers.append(new_proc)
+                active_consumers.append(new_proc)
+                peak_consumers = max(peak_consumers, len(active_consumers))
+                print(
+                    f"[backpressure] SCALE UP → {len(active_consumers)} consumers"
+                )
+        else:
+            # Producer stopped — wait for queue to empty
+            if queue_depth == 0 and depth["not_visible"] == 0:
+                print("[backpressure] Queue drained, exiting monitor loop")
+                break
+
+    # Phase 3: Wait for full drain
+    print("[backpressure] Waiting for queue to fully drain ...")
+    wait_for_queue_empty(sqs, queue_url, timeout=args.queue_timeout)
+
+    print("[backpressure] Waiting for all consumers to exit ...")
+    for proc in consumers:
+        try:
+            proc.wait(timeout=args.consumer_timeout)
+        except subprocess.TimeoutExpired:
+            print(f"[backpressure] Consumer pid={proc.pid} timed out, terminating ...")
+            proc.terminate()
+            proc.wait(timeout=10)
+
+    # Phase 4: Assertions
+    total_completed = _count_completed()
+    print(f"[backpressure] Running assertions (completed={total_completed}) ...")
+
+    # Queue fully drained
+    final_depth = get_queue_depth(sqs, queue_url)
+    if final_depth["visible"] != 0 or final_depth["not_visible"] != 0:
+        raise RuntimeError(
+            f"Queue not empty: visible={final_depth['visible']} "
+            f"not_visible={final_depth['not_visible']}"
+        )
+
+    # DLQ empty
+    ensure_queue_empty(sqs, dlq_url, "DLQ")
+
+    # Scaling actually happened
+    if peak_consumers <= 1:
+        raise RuntimeError(
+            f"Expected scaling to occur (peak > 1), but peak_consumers={peak_consumers}"
+        )
+
+    # Sanity: completed count should be reasonably close to produced estimate
+    if total_completed == 0:
+        raise RuntimeError("No messages were completed")
+
+    print(
+        f"[backpressure] PASS | completed={total_completed} "
+        f"peak_consumers={peak_consumers}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -619,6 +845,31 @@ def parse_args() -> argparse.Namespace:
         help="Timeout (seconds) to wait for queue to drain",
     )
 
+    bp = subparsers.add_parser("backpressure", help="Backpressure / auto-scaling scenario")
+    bp.add_argument("--rate", type=int, default=5, help="Producer messages per second")
+    bp.add_argument("--batch-size", type=int, default=10, help="Producer batch size (<=10)")
+    bp.add_argument(
+        "--poll-interval", type=int, default=5, help="Seconds between depth samples"
+    )
+    bp.add_argument(
+        "--consumer-timeout",
+        type=int,
+        default=300,
+        help="Timeout (seconds) for consumer subprocesses",
+    )
+    bp.add_argument(
+        "--idle-timeout",
+        type=int,
+        default=30,
+        help="Idle timeout for consumers to exit when queue is empty",
+    )
+    bp.add_argument(
+        "--queue-timeout",
+        type=int,
+        default=300,
+        help="Timeout (seconds) to wait for queue to drain",
+    )
+
     return parser.parse_args()
 
 
@@ -630,6 +881,7 @@ def main() -> None:
         "crash": scenario_crash,
         "duplicates": scenario_duplicates,
         "poison": scenario_poison,
+        "backpressure": scenario_backpressure,
     }.get(args.scenario)
 
     if not scenario_fn:
