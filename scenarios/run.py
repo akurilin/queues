@@ -1,155 +1,54 @@
-"""Scenario runner for queue behaviors with per-scenario infrastructure."""
+"""Scenario runner for queue behaviors against pre-provisioned infrastructure."""
 
 from __future__ import annotations
 
 import argparse
 import json
 import os
-import secrets
 import subprocess
 import sys
 import time
 import uuid
-from contextlib import contextmanager
 from pathlib import Path
 from typing import Dict, Optional
 
 import boto3
 from botocore.client import BaseClient
-from botocore.session import Session
 
 from validate_infra import validate_scenario_infra
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-SCENARIOS_TF_DIR = Path(__file__).resolve().parent / "terraform"
+TERRAFORM_DIR = REPO_ROOT / "terraform"
+CONSUME_SCRIPT = REPO_ROOT / "consumer" / "consume.py"
 DEFAULT_VISIBILITY_BUFFER = 15  # seconds to wait for visibility timeout expiry
 
+# Map CLI scenario names to terraform output keys
+SCENARIO_TF_KEYS = {
+    "happy": "happy",
+    "crash": "crash",
+    "duplicates": "dup",
+}
+
 
 # ---------------------------------------------------------------------------
-# Terraform lifecycle
+# Terraform outputs
 # ---------------------------------------------------------------------------
 
 
-def terraform_cmd(
-    args: list[str], tf_dir: Optional[str] = None, stream: bool = False
-) -> subprocess.CompletedProcess:
-    """Run a terraform command in the scenarios/terraform/ directory.
+def read_terraform_outputs() -> Dict:
+    """Read outputs from the single terraform/ directory.
 
-    When *stream* is True the command's stdout/stderr go straight to the
-    terminal so the user can watch progress (useful for apply/destroy).
+    Returns a dict with 'aws_region' and 'scenarios' (a map of scenario key
+    to its resource references).
     """
-    cwd = tf_dir or str(SCENARIOS_TF_DIR)
-    cmd = ["terraform", f"-chdir={cwd}"] + args
-    if stream:
-        return subprocess.run(cmd, text=True, check=True)
-    return subprocess.run(cmd, capture_output=True, text=True, check=True)
-
-
-def generate_workspace_name(scenario: str) -> str:
-    """Return a unique workspace name: {scenario}-{random_8_hex}."""
-    return f"{scenario}-{secrets.token_hex(4)}"
-
-
-def _tfvars_path(workspace: str) -> Path:
-    """Return the path to the workspace-specific .tfvars file."""
-    return SCENARIOS_TF_DIR / f"{workspace}.tfvars.json"
-
-
-def get_main_tf_outputs() -> Dict[str, str]:
-    """Read terraform outputs from the main infrastructure."""
     result = subprocess.run(
-        ["terraform", f"-chdir={REPO_ROOT / 'terraform'}", "output", "-json"],
+        ["terraform", f"-chdir={TERRAFORM_DIR}", "output", "-json"],
         capture_output=True,
         text=True,
         check=True,
     )
     raw = json.loads(result.stdout)
     return {k: v["value"] for k, v in raw.items()}
-
-
-def infra_up(
-    scenario: str,
-    container_image: str,
-    main_outputs: Dict,
-    tf_vars: Optional[Dict[str, str]] = None,
-) -> Dict:
-    """Provision per-scenario infrastructure. Returns terraform outputs + _workspace."""
-    workspace = generate_workspace_name(scenario)
-    tfvars = _tfvars_path(workspace)
-
-    # Build tfvars
-    vars_dict = {
-        "scenario_name": workspace,
-        "container_image": container_image,
-        "aws_region": main_outputs.get("aws_region", os.environ.get("AWS_REGION", "us-west-1")),
-        "subnets": main_outputs["subnet_ids"],
-        "security_group_ids": main_outputs["security_group_ids"],
-        "execution_role_arn": main_outputs["execution_role_arn"],
-        "log_group_name": main_outputs["log_group_name"],
-    }
-    if tf_vars:
-        vars_dict.update(tf_vars)
-
-    tfvars.write_text(json.dumps(vars_dict, indent=2))
-    print(f"[infra] Wrote {tfvars}")
-
-    print(f"[infra] terraform init ...")
-    terraform_cmd(["init", "-input=false"])
-
-    print(f"[infra] Creating workspace {workspace} ...")
-    terraform_cmd(["workspace", "new", workspace])
-
-    print(f"[infra] terraform apply ...")
-    terraform_cmd(["apply", "-auto-approve", f"-var-file={tfvars}"], stream=True)
-
-    print(f"[infra] Reading outputs ...")
-    result = terraform_cmd(["output", "-json"])
-    raw = json.loads(result.stdout)
-    outputs = {k: v["value"] for k, v in raw.items()}
-    outputs["_workspace"] = workspace
-    outputs["_container_image"] = container_image
-    return outputs
-
-
-def infra_down(workspace: str) -> None:
-    """Destroy per-scenario infrastructure and clean up workspace."""
-    tfvars = _tfvars_path(workspace)
-    try:
-        print(f"[infra] Selecting workspace {workspace} ...")
-        terraform_cmd(["workspace", "select", workspace])
-
-        print(f"[infra] terraform destroy ...")
-        if tfvars.exists():
-            terraform_cmd(["destroy", "-auto-approve", f"-var-file={tfvars}"], stream=True)
-        else:
-            terraform_cmd(["destroy", "-auto-approve"], stream=True)
-
-        print(f"[infra] Cleaning up workspace {workspace} ...")
-        terraform_cmd(["workspace", "select", "default"])
-        terraform_cmd(["workspace", "delete", workspace])
-    finally:
-        if tfvars.exists():
-            tfvars.unlink()
-            print(f"[infra] Removed {tfvars}")
-
-
-@contextmanager
-def scenario_infra(
-    scenario: str,
-    container_image: str,
-    main_outputs: Dict,
-    tf_vars: Optional[Dict[str, str]] = None,
-):
-    """Context manager: provision → validate → yield outputs → destroy."""
-    outputs = infra_up(scenario, container_image, main_outputs, tf_vars)
-    workspace = outputs["_workspace"]
-    try:
-        profile = os.environ.get("AWS_PROFILE")
-        region = outputs.get("aws_region", "us-west-1")
-        validate_scenario_infra(outputs, main_outputs, region, profile, container_image)
-        yield outputs
-    finally:
-        infra_down(workspace)
 
 
 # ---------------------------------------------------------------------------
@@ -159,13 +58,13 @@ def scenario_infra(
 
 def build_sqs_client(region: str, profile: Optional[str]) -> BaseClient:
     """Construct an SQS client using region/profile."""
-    session: Session = boto3.Session(region_name=region, profile_name=profile or None)
+    session = boto3.Session(region_name=region, profile_name=profile or None)
     return session.client("sqs")
 
 
 def build_dynamo_resource(region: str, profile: Optional[str]):
     """Construct a DynamoDB resource using region/profile."""
-    session: Session = boto3.Session(region_name=region, profile_name=profile or None)
+    session = boto3.Session(region_name=region, profile_name=profile or None)
     return session.resource("dynamodb")
 
 
@@ -236,81 +135,30 @@ def wait_for_queue_empty(
 
 
 # ---------------------------------------------------------------------------
-# ECS helpers
+# Local consumer helpers
 # ---------------------------------------------------------------------------
 
 
-def run_ecs_task(
-    cluster: str,
-    task_definition: str,
-    container_name: str,
-    subnets: list[str],
-    security_groups: list[str],
-    env: Dict[str, str],
-) -> str:
-    """Start a one-off ECS task with env overrides; return task ARN."""
-    env_overrides = [{"name": k, "value": v} for k, v in env.items()]
-    cmd = [
-        "aws",
-        "ecs",
-        "run-task",
-        "--cluster",
-        cluster,
-        "--task-definition",
-        task_definition,
-        "--launch-type",
-        "FARGATE",
-        "--network-configuration",
-        json.dumps(
-            {
-                "awsvpcConfiguration": {
-                    "subnets": subnets,
-                    "securityGroups": security_groups,
-                    "assignPublicIp": "ENABLED",
-                }
-            }
-        ),
-        "--overrides",
-        json.dumps(
-            {
-                "containerOverrides": [
-                    {"name": container_name, "environment": env_overrides}
-                ]
-            }
-        ),
-    ]
-    data = subprocess.check_output(cmd)
-    payload = json.loads(data)
-    failures = payload.get("failures", [])
-    if failures:
-        raise RuntimeError(f"ECS run-task failed: {failures}")
-    tasks = payload.get("tasks", [])
-    if not tasks:
-        raise RuntimeError("ECS run-task returned no tasks")
-    return tasks[0]["taskArn"]
+def run_local_consumer(env: Dict[str, str], timeout: int) -> int:
+    """Run consume.py as a blocking subprocess. Returns exit code."""
+    full_env = {**os.environ, **env}
+    print(f"[consumer] Running {CONSUME_SCRIPT} locally ...")
+    result = subprocess.run(
+        [sys.executable, str(CONSUME_SCRIPT)],
+        env=full_env,
+        timeout=timeout,
+    )
+    return result.returncode
 
 
-def wait_for_task_stop(cluster: str, task_arn: str, timeout: int = 300) -> dict:
-    """Wait until the task stops and return its description."""
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        desc = subprocess.check_output(
-            ["aws", "ecs", "describe-tasks", "--cluster", cluster, "--tasks", task_arn]
-        )
-        payload = json.loads(desc)
-        tasks = payload.get("tasks", [])
-        if tasks and tasks[0].get("lastStatus") == "STOPPED":
-            return tasks[0]
-        time.sleep(3)
-    raise RuntimeError("ECS task did not stop in time")
-
-
-def get_container_exit_code(task: dict, container_name: str) -> Optional[int]:
-    """Extract exit code for a specific container from task description."""
-    for c in task.get("containers", []):
-        if c.get("name") == container_name:
-            return c.get("exitCode")
-    return None
+def run_local_consumer_async(env: Dict[str, str]) -> subprocess.Popen:
+    """Start consume.py as a background subprocess. Returns the Popen handle."""
+    full_env = {**os.environ, **env}
+    print(f"[consumer] Starting {CONSUME_SCRIPT} in background ...")
+    return subprocess.Popen(
+        [sys.executable, str(CONSUME_SCRIPT)],
+        env=full_env,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -342,19 +190,13 @@ def run_producer(count: int, batch_size: int, region: str, queue_url: str, profi
 # ---------------------------------------------------------------------------
 
 
-def scenario_happy(args: argparse.Namespace, outputs: Dict, main_outputs: Dict) -> None:
+def scenario_happy(args: argparse.Namespace, outputs: Dict) -> None:
     """Scenario 1: Happy path — messages flow through cleanly."""
     queue_url = outputs["queue_url"]
     region = outputs["aws_region"]
     profile = os.environ.get("AWS_PROFILE", "")
     dlq_url = queue_url_from_arn(outputs["dlq_arn"])
     sqs = build_sqs_client(region, profile)
-
-    cluster = outputs["cluster_name"]
-    task_definition = outputs["task_definition_arn"]
-    container = outputs["container_name"]
-    subnets = main_outputs["subnet_ids"]
-    security_groups = main_outputs["security_group_ids"]
 
     message_count = args.count or 5
     batch_size = min(args.batch_size or 5, 10)
@@ -364,13 +206,8 @@ def scenario_happy(args: argparse.Namespace, outputs: Dict, main_outputs: Dict) 
     print("[happy] Confirming messages are enqueued ...")
     wait_for_messages_enqueued(sqs, queue_url, message_count)
 
-    print("[happy] Running ECS task to drain messages ...")
-    task_arn = run_ecs_task(
-        cluster,
-        task_definition,
-        container,
-        subnets,
-        security_groups,
+    print("[happy] Running local consumer to drain messages ...")
+    exit_code = run_local_consumer(
         env={
             "QUEUE_URL": queue_url,
             "AWS_REGION": region,
@@ -378,11 +215,10 @@ def scenario_happy(args: argparse.Namespace, outputs: Dict, main_outputs: Dict) 
             "LOG_LEVEL": "INFO",
             "IDLE_TIMEOUT_SECONDS": "30",
         },
+        timeout=args.consumer_timeout,
     )
-    task_desc = wait_for_task_stop(cluster, task_arn, timeout=args.consumer_timeout)
-    exit_code = get_container_exit_code(task_desc, container)
-    if exit_code not in (0, None):
-        raise RuntimeError(f"Happy task failed with exit code {exit_code}")
+    if exit_code != 0:
+        raise RuntimeError(f"Happy consumer failed with exit code {exit_code}")
 
     print("[happy] Waiting for queue to drain ...")
     wait_for_queue_empty(sqs, queue_url)
@@ -391,7 +227,7 @@ def scenario_happy(args: argparse.Namespace, outputs: Dict, main_outputs: Dict) 
     print("[happy] PASS")
 
 
-def scenario_crash(args: argparse.Namespace, outputs: Dict, main_outputs: Dict) -> None:
+def scenario_crash(args: argparse.Namespace, outputs: Dict) -> None:
     """Scenario 2: Consumer crash mid-processing, then redelivery."""
     queue_url = outputs["queue_url"]
     region = outputs["aws_region"]
@@ -399,25 +235,14 @@ def scenario_crash(args: argparse.Namespace, outputs: Dict, main_outputs: Dict) 
     dlq_url = queue_url_from_arn(outputs["dlq_arn"])
     sqs = build_sqs_client(region, profile)
 
-    cluster = outputs["cluster_name"]
-    task_definition = outputs["task_definition_arn"]
-    container = outputs["container_name"]
-    subnets = main_outputs["subnet_ids"]
-    security_groups = main_outputs["security_group_ids"]
-
     message_count = 1
     print(f"[crash] Sending {message_count} message ...")
     run_producer(message_count, batch_size=1, region=region, queue_url=queue_url, profile=profile)
     print("[crash] Confirming message is enqueued ...")
     wait_for_messages_enqueued(sqs, queue_url, message_count)
 
-    print("[crash] Running ECS task that will crash mid-processing ...")
-    crash_task = run_ecs_task(
-        cluster,
-        task_definition,
-        container,
-        subnets,
-        security_groups,
+    print("[crash] Running local consumer that will crash mid-processing ...")
+    exit_code = run_local_consumer(
         env={
             "QUEUE_URL": queue_url,
             "AWS_REGION": region,
@@ -426,24 +251,17 @@ def scenario_crash(args: argparse.Namespace, outputs: Dict, main_outputs: Dict) 
             "LOG_LEVEL": "INFO",
             "IDLE_TIMEOUT_SECONDS": "30",
         },
+        timeout=args.consumer_timeout,
     )
-    print(f"[crash] Crash task ARN: {crash_task}")
-    crash_desc = wait_for_task_stop(cluster, crash_task, timeout=args.consumer_timeout)
-    crash_exit = get_container_exit_code(crash_desc, container)
-    if crash_exit == 0:
-        raise RuntimeError("Crash task exited 0 but was expected to fail")
+    if exit_code == 0:
+        raise RuntimeError("Crash consumer exited 0 but was expected to fail")
 
     visibility_wait = args.visibility_wait or DEFAULT_VISIBILITY_BUFFER
     print(f"[crash] Waiting {visibility_wait}s for visibility timeout to expire ...")
     time.sleep(visibility_wait)
 
     print("[crash] Rerunning consumer to process redelivered message ...")
-    task2 = run_ecs_task(
-        cluster,
-        task_definition,
-        container,
-        subnets,
-        security_groups,
+    exit_code2 = run_local_consumer(
         env={
             "QUEUE_URL": queue_url,
             "AWS_REGION": region,
@@ -451,11 +269,10 @@ def scenario_crash(args: argparse.Namespace, outputs: Dict, main_outputs: Dict) 
             "LOG_LEVEL": "INFO",
             "IDLE_TIMEOUT_SECONDS": "30",
         },
+        timeout=args.consumer_timeout,
     )
-    task2_desc = wait_for_task_stop(cluster, task2, timeout=args.consumer_timeout)
-    exit2 = get_container_exit_code(task2_desc, container)
-    if exit2 not in (0, None):
-        raise RuntimeError(f"Second task failed with exit code {exit2}")
+    if exit_code2 != 0:
+        raise RuntimeError(f"Second consumer failed with exit code {exit_code2}")
 
     print("[crash] Waiting for queue to drain ...")
     wait_for_queue_empty(sqs, queue_url)
@@ -464,19 +281,13 @@ def scenario_crash(args: argparse.Namespace, outputs: Dict, main_outputs: Dict) 
     print("[crash] PASS")
 
 
-def scenario_duplicates(args: argparse.Namespace, outputs: Dict, main_outputs: Dict) -> None:
+def scenario_duplicates(args: argparse.Namespace, outputs: Dict) -> None:
     """Scenario 3: Duplicate delivery handled via idempotent side effects."""
     queue_url = outputs["queue_url"]
     region = outputs["aws_region"]
     profile = os.environ.get("AWS_PROFILE", "")
     status_table_name = outputs["message_status_table"]
     completed_table_name = outputs["message_completed_table"]
-
-    cluster = outputs["cluster_name"]
-    task_definition = outputs["task_definition_arn"]
-    container = outputs["container_name"]
-    subnets = main_outputs["subnet_ids"]
-    security_groups = main_outputs["security_group_ids"]
 
     dlq_url = queue_url_from_arn(outputs["dlq_arn"])
     sqs = build_sqs_client(region, profile)
@@ -504,23 +315,17 @@ def scenario_duplicates(args: argparse.Namespace, outputs: Dict, main_outputs: D
         "AWS_REGION": region,
     }
 
-    print("[dup] Starting two ECS tasks concurrently (long work > visibility timeout) ...")
-    task1 = run_ecs_task(
-        cluster, task_definition, container, subnets, security_groups, env=common_env,
-    )
+    print("[dup] Starting two local consumers concurrently (long work > visibility timeout) ...")
+    proc1 = run_local_consumer_async(common_env)
     time.sleep(args.second_start_delay)
-    task2 = run_ecs_task(
-        cluster, task_definition, container, subnets, security_groups, env=common_env,
-    )
+    proc2 = run_local_consumer_async(common_env)
 
-    task1_desc = wait_for_task_stop(cluster, task1, timeout=args.consumer_timeout)
-    task2_desc = wait_for_task_stop(cluster, task2, timeout=args.consumer_timeout)
-    exit1 = get_container_exit_code(task1_desc, container)
-    exit2 = get_container_exit_code(task2_desc, container)
-    if exit1 not in (0, None):
-        raise RuntimeError(f"[dup] first task failed with exit code {exit1}")
-    if exit2 not in (0, None):
-        raise RuntimeError(f"[dup] second task failed with exit code {exit2}")
+    proc1.wait(timeout=args.consumer_timeout)
+    proc2.wait(timeout=args.consumer_timeout)
+    if proc1.returncode != 0:
+        raise RuntimeError(f"[dup] first consumer failed with exit code {proc1.returncode}")
+    if proc2.returncode != 0:
+        raise RuntimeError(f"[dup] second consumer failed with exit code {proc2.returncode}")
 
     print("[dup] Waiting for queue to drain ...")
     wait_for_queue_empty(sqs, queue_url, timeout=args.queue_timeout)
@@ -551,30 +356,8 @@ def scenario_duplicates(args: argparse.Namespace, outputs: Dict, main_outputs: D
 # ---------------------------------------------------------------------------
 
 
-def latest_ecr_tag(repo_url: str) -> str:
-    """Return the tag of the most recently pushed image in the ECR repo."""
-    repo_name = repo_url.split("/", 1)[-1]
-    region = repo_url.split(".")[3]
-    ecr = boto3.Session(region_name=region).client("ecr")
-    resp = ecr.describe_images(
-        repositoryName=repo_name,
-        filter={"tagStatus": "TAGGED"},
-    )
-    images = resp.get("imageDetails", [])
-    if not images:
-        raise SystemExit(f"No tagged images found in ECR repo {repo_name}")
-    newest = max(images, key=lambda i: i["imagePushedAt"])
-    tags = newest.get("imageTags", [])
-    if not tags:
-        raise SystemExit(f"Most recent image in {repo_name} has no tags")
-    return tags[0]
-
-
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run queue scenarios")
-    parser.add_argument(
-        "--image-tag", type=str, default=None, help="Container image tag (default: most recent)"
-    )
     subparsers = parser.add_subparsers(dest="scenario", required=True)
 
     happy = subparsers.add_parser("happy", help="Happy path scenario")
@@ -584,7 +367,7 @@ def parse_args() -> argparse.Namespace:
         "--consumer-timeout",
         type=int,
         default=120,
-        help="Timeout (seconds) for ECS task to complete",
+        help="Timeout (seconds) for consumer subprocess",
     )
 
     crash = subparsers.add_parser("crash", help="Consumer crash mid-processing scenario")
@@ -639,14 +422,6 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
 
-    print("[main] Reading main terraform outputs ...")
-    main_outputs = get_main_tf_outputs()
-
-    ecr_repo_url = main_outputs["ecr_repository_url"]
-    image_tag = args.image_tag or latest_ecr_tag(ecr_repo_url)
-    container_image = f"{ecr_repo_url}:{image_tag}"
-    print(f"[main] Container image: {container_image}")
-
     scenario_fn = {
         "happy": scenario_happy,
         "crash": scenario_crash,
@@ -656,8 +431,25 @@ def main() -> None:
     if not scenario_fn:
         raise SystemExit(f"Unknown scenario {args.scenario}")
 
-    with scenario_infra(args.scenario, container_image, main_outputs) as outputs:
-        scenario_fn(args, outputs, main_outputs)
+    tf_outputs = read_terraform_outputs()
+    region = tf_outputs["aws_region"]
+    tf_key = SCENARIO_TF_KEYS[args.scenario]
+    scenario_resources = tf_outputs["scenarios"][tf_key]
+
+    # Build outputs dict matching what scenario functions expect
+    outputs = {
+        "queue_url": scenario_resources["queue_url"],
+        "dlq_arn": scenario_resources["dlq_arn"],
+        "message_status_table": scenario_resources["message_status_table"],
+        "message_completed_table": scenario_resources["message_completed_table"],
+        "aws_region": region,
+    }
+
+    profile = os.environ.get("AWS_PROFILE")
+    print(f"[run] Validating {args.scenario} infrastructure ...")
+    validate_scenario_infra(outputs, region, profile)
+
+    scenario_fn(args, outputs)
 
 
 if __name__ == "__main__":
