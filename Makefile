@@ -1,5 +1,6 @@
 .PHONY: help preflight infra-up infra-down infra-validate validate \
-       scenario-happy scenario-crash scenario-duplicates scenario-poison scenario-backpressure scenarios venv
+       scenario-happy scenario-crash scenario-duplicates scenario-poison scenario-backpressure \
+       scenarios scenarios-fast scenarios-slow venv
 
 ARGS ?=
 
@@ -61,6 +62,8 @@ $(VENV_STAMP): scenarios/requirements.txt
 	$(VENV)/bin/pip install -r scenarios/requirements.txt
 	@touch $@
 
+# --- Fast scenarios (seconds) ---
+
 scenario-happy: $(VENV_STAMP) ## Run the happy-path scenario
 	$(VENV)/bin/python scenarios/run.py happy $(ARGS)
 
@@ -73,7 +76,15 @@ scenario-duplicates: $(VENV_STAMP) ## Run the duplicates scenario
 scenario-poison: $(VENV_STAMP) ## Run the poison message scenario
 	$(VENV)/bin/python scenarios/run.py poison $(ARGS)
 
-scenario-backpressure: $(VENV_STAMP) ## Run the backpressure / scaling scenario
+scenarios-fast: scenario-happy scenario-crash scenario-duplicates scenario-poison ## Run fast scenarios only
+
+# --- Slow scenarios (minutes) ---
+
+scenario-backpressure: $(VENV_STAMP) ## Run the backpressure / scaling scenario (slow)
 	$(VENV)/bin/python scenarios/run.py backpressure $(ARGS)
 
-scenarios: scenario-happy scenario-crash scenario-duplicates scenario-poison scenario-backpressure ## Run all scenarios in sequence
+scenarios-slow: scenario-backpressure ## Run slow scenarios only
+
+# --- All ---
+
+scenarios: scenarios-fast scenarios-slow ## Run all scenarios (fast then slow)

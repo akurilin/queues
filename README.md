@@ -140,25 +140,27 @@ Each message contains a JSON payload with a UUID `id` and a random `work` value 
 ## Scenarios
 `scenarios/` contains self-contained setups to exercise typical queue behaviors. Each scenario uses its own isolated SQS queue + DLQ and DynamoDB tables, all provisioned by the shared `terraform/` configuration. Consumers and producers run as local Python subprocesses.
 
+**Fast** (finish in seconds):
 - **Happy path** (`make scenario-happy`): messages flow through cleanly, all processed and deleted.
 - **Crash recovery** (`make scenario-crash`): consumer crashes after receiving; observe redelivery and recovery.
 - **Duplicate delivery** (`make scenario-duplicates`): slow processing triggers visibility timeout, causing redelivery; DynamoDB-backed idempotency prevents duplicate side effects.
 - **Poison messages** (`make scenario-poison`): messages with a poison marker are rejected and redrive to the DLQ after max retries.
+
+**Slow** (5–10 minutes):
 - **Backpressure / auto-scaling** (`make scenario-backpressure`): a continuous producer floods the queue; the runner monitors queue depth and spawns additional consumers until equilibrium.
 
 ### Running scenarios
 - **Prereqs**: infrastructure provisioned (`make infra-up`), AWS CLI + Terraform on PATH.
 - **Quick start** (venv is created automatically):
   ```bash
+  make scenarios-fast        # run the 4 fast scenarios
+  make scenarios-slow        # run slow scenarios (backpressure)
+  make scenarios             # run everything (fast then slow)
+  ```
+- **Individual scenarios**:
+  ```bash
   make scenario-happy
   make scenario-crash
-  make scenario-duplicates
-  make scenario-poison
-  make scenario-backpressure
-  ```
-- **Run all at once**:
-  ```bash
-  make scenarios
   ```
 - Pass extra arguments via `ARGS`:
   ```bash
@@ -182,7 +184,9 @@ Run `make help` to see all targets. Key ones:
 | `make venv` | Create/update the project venv |
 | `make validate` | Validate scenario infrastructure is healthy |
 | `make scenario-*` | Run individual scenarios |
-| `make scenarios` | Run all 5 scenarios sequentially |
+| `make scenarios-fast` | Run the 4 fast scenarios |
+| `make scenarios-slow` | Run slow scenarios (backpressure) |
+| `make scenarios` | Run all scenarios (fast then slow) |
 
 ## Tear down
 ```bash
