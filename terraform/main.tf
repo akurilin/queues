@@ -2,9 +2,10 @@ locals {
   name = var.project_name
 
   scenarios = {
-    happy = "${local.name}-happy"
-    crash = "${local.name}-crash"
-    dup   = "${local.name}-dup"
+    happy  = "${local.name}-happy"
+    crash  = "${local.name}-crash"
+    dup    = "${local.name}-dup"
+    poison = "${local.name}-poison"
   }
 
   env_file_path = "${path.module}/../.env"
@@ -26,7 +27,7 @@ module "sqs" {
   visibility_timeout_seconds = var.queue_visibility_timeout
   receive_wait_time_seconds  = var.queue_receive_wait
   redrive_policy = {
-    maxReceiveCount = 5
+    maxReceiveCount = 2
   }
 }
 

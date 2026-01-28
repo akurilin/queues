@@ -42,6 +42,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--batch-size", type=int, default=10, help="Batch size per request (max 10)"
     )
+    parser.add_argument(
+        "--poison-count",
+        type=int,
+        default=0,
+        help="Number of messages to send with a poison payload",
+    )
     return parser.parse_args()
 
 
@@ -52,15 +58,24 @@ def build_sqs_client(region: Optional[str], profile: Optional[str]) -> BaseClien
     return session.client("sqs")
 
 
-def make_entries(start: int, count: int) -> List[dict[str, str]]:
-    """Create a batch of SQS message entries with deterministic IDs."""
+def make_entries(
+    start: int, count: int, poison_indices: Optional[set[int]] = None
+) -> List[dict[str, str]]:
+    """Create a batch of SQS message entries with deterministic IDs.
 
+    Entries whose global index appears in *poison_indices* get a poison payload
+    instead of the normal work payload.
+    """
+    poison_indices = poison_indices or set()
     entries: List[dict[str, str]] = []
     for i in range(start, start + count):
-        payload = {
-            "id": str(uuid.uuid4()),
-            "work": random.randint(1, 1000),
-        }
+        if i in poison_indices:
+            payload = {"id": str(uuid.uuid4()), "poison": True, "work": "POISON"}
+        else:
+            payload = {
+                "id": str(uuid.uuid4()),
+                "work": random.randint(1, 1000),
+            }
         entries.append(
             {
                 "Id": str(i),
@@ -105,6 +120,11 @@ def main() -> None:
 
     # Ensure total message count is non-negative (prevent negative values from args)
     total = max(args.n, 0)
+    # Compute global indices for poison messages
+    poison_count = max(0, min(args.poison_count, total))
+    poison_indices: set[int] = set(random.sample(range(total), poison_count)) if poison_count else set()
+    if poison_count:
+        logging.info("Poison messages (%s) at indices: %s", poison_count, sorted(poison_indices))
     # Track successful message sends for final statistics
     sent = 0
     # Track failed message sends for error reporting
@@ -128,7 +148,7 @@ def main() -> None:
         # Calculate how many messages to send in this batch (may be smaller at the end)
         chunk = min(batch_size, total - message_index)
         # Generate the batch of message entries with unique IDs and payloads
-        entries = make_entries(message_index, chunk)
+        entries = make_entries(message_index, chunk, poison_indices)
         # Send the batch to SQS and get response (may contain failures)
         response: dict[str, Any] = sqs.send_message_batch(
             QueueUrl=args.queue_url, Entries=entries

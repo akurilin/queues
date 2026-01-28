@@ -14,6 +14,7 @@ from typing import Dict, Optional
 
 import boto3
 from botocore.client import BaseClient
+from botocore.exceptions import ClientError
 
 from validate_infra import validate_scenario_infra
 
@@ -27,6 +28,7 @@ SCENARIO_TF_KEYS = {
     "happy": "happy",
     "crash": "crash",
     "duplicates": "dup",
+    "poison": "poison",
 }
 
 
@@ -92,6 +94,21 @@ def queue_url_from_arn(arn: str) -> str:
     return f"https://sqs.{region}.amazonaws.com/{account_id}/{queue_name}"
 
 
+def purge_queue(sqs: BaseClient, queue_url: str, label: str) -> None:
+    """Purge all messages from a queue. Silently ignores 'already purged' errors."""
+    try:
+        sqs.purge_queue(QueueUrl=queue_url)
+        print(f"[purge] Purged {label} queue {queue_url}")
+    except ClientError as exc:
+        code = exc.response.get("Error", {}).get("Code", "")
+        if code == "AWS.SimpleQueueService.PurgeQueueInProgress":
+            print(f"[purge] {label} queue purge already in progress")
+        else:
+            raise
+    # SQS purge is async — give it a moment to take effect
+    time.sleep(3)
+
+
 def ensure_queue_empty(sqs: BaseClient, queue_url: str, label: str) -> None:
     """Verify a queue has no visible or in-flight messages."""
     depth = get_queue_depth(sqs, queue_url)
@@ -122,14 +139,27 @@ def wait_for_messages_enqueued(
 
 
 def wait_for_queue_empty(
-    sqs: BaseClient, queue_url: str, timeout: int = 90, poll_seconds: int = 3
+    sqs: BaseClient,
+    queue_url: str,
+    timeout: int = 90,
+    poll_seconds: int = 3,
+    confirmations: int = 3,
 ) -> None:
-    """Wait until both visible and in-flight counts drop to zero or timeout."""
+    """Wait until both visible and in-flight counts drop to zero or timeout.
+
+    SQS approximate counts are eventually consistent, so we require
+    *confirmations* consecutive zero readings before declaring the queue empty.
+    """
     deadline = time.time() + timeout
+    zeros_seen = 0
     while time.time() < deadline:
         depth = get_queue_depth(sqs, queue_url)
         if depth["visible"] == 0 and depth["not_visible"] == 0:
-            return
+            zeros_seen += 1
+            if zeros_seen >= confirmations:
+                return
+        else:
+            zeros_seen = 0
         time.sleep(poll_seconds)
     raise RuntimeError("Queue did not drain within timeout")
 
@@ -166,7 +196,14 @@ def run_local_consumer_async(env: Dict[str, str]) -> subprocess.Popen:
 # ---------------------------------------------------------------------------
 
 
-def run_producer(count: int, batch_size: int, region: str, queue_url: str, profile: str) -> None:
+def run_producer(
+    count: int,
+    batch_size: int,
+    region: str,
+    queue_url: str,
+    profile: str,
+    poison_count: int = 0,
+) -> None:
     """Invoke the producer script to push messages."""
     cmd = [
         sys.executable,
@@ -180,6 +217,8 @@ def run_producer(count: int, batch_size: int, region: str, queue_url: str, profi
         "--batch-size",
         str(batch_size),
     ]
+    if poison_count > 0:
+        cmd.extend(["--poison-count", str(poison_count)])
     if profile:
         cmd.extend(["--profile", profile])
     subprocess.run(cmd, check=True)
@@ -351,6 +390,68 @@ def scenario_duplicates(args: argparse.Namespace, outputs: Dict) -> None:
     )
 
 
+def scenario_poison(args: argparse.Namespace, outputs: Dict) -> None:
+    """Scenario 4: Poison messages exhaust retries and land in the DLQ."""
+    queue_url = outputs["queue_url"]
+    region = outputs["aws_region"]
+    profile = os.environ.get("AWS_PROFILE", "")
+    dlq_url = queue_url_from_arn(outputs["dlq_arn"])
+    sqs = build_sqs_client(region, profile)
+
+    print("[poison] Purging queues to start clean ...")
+    purge_queue(sqs, queue_url, "primary")
+    purge_queue(sqs, dlq_url, "DLQ")
+
+    total_count = args.count
+    poison_count = args.poison_count
+    good_count = total_count - poison_count
+
+    print(f"[poison] Sending {total_count} messages ({poison_count} poison, {good_count} good) ...")
+    run_producer(
+        total_count,
+        batch_size=min(10, total_count),
+        region=region,
+        queue_url=queue_url,
+        profile=profile,
+        poison_count=poison_count,
+    )
+    print("[poison] Confirming messages are enqueued ...")
+    wait_for_messages_enqueued(sqs, queue_url, total_count)
+
+    print("[poison] Running consumer with REJECT_PAYLOAD_MARKER=POISON ...")
+    consumer_env = {
+        "QUEUE_URL": queue_url,
+        "AWS_REGION": region,
+        "REJECT_PAYLOAD_MARKER": "POISON",
+        "IDLE_TIMEOUT_SECONDS": str(args.idle_timeout),
+        "LOG_LEVEL": "INFO",
+        "MAX_MESSAGES": "1",
+        "WAIT_TIME_SECONDS": "5",
+    }
+    if outputs.get("message_status_table") and outputs.get("message_completed_table"):
+        consumer_env["MESSAGE_STATUS_TABLE"] = outputs["message_status_table"]
+        consumer_env["MESSAGE_COMPLETED_TABLE"] = outputs["message_completed_table"]
+
+    exit_code = run_local_consumer(env=consumer_env, timeout=args.consumer_timeout)
+    if exit_code != 0:
+        raise RuntimeError(f"Poison consumer failed with exit code {exit_code}")
+
+    print("[poison] Waiting for main queue to fully drain ...")
+    wait_for_queue_empty(sqs, queue_url, timeout=args.queue_timeout)
+    ensure_queue_empty(sqs, queue_url, "primary")
+
+    print("[poison] Checking DLQ for poison messages ...")
+    dlq_depth = get_queue_depth(sqs, dlq_url)
+    dlq_count = dlq_depth["visible"] + dlq_depth["not_visible"]
+    if dlq_count != poison_count:
+        raise RuntimeError(
+            f"Expected {poison_count} messages in DLQ, found {dlq_count} "
+            f"(visible={dlq_depth['visible']}, not_visible={dlq_depth['not_visible']})"
+        )
+
+    print(f"[poison] PASS | good={good_count} processed, poison={poison_count} in DLQ")
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -416,6 +517,28 @@ def parse_args() -> argparse.Namespace:
         help="Timeout (seconds) to wait for queue to drain",
     )
 
+    poison = subparsers.add_parser("poison", help="Poison message scenario (bad messages go to DLQ)")
+    poison.add_argument("--count", type=int, default=5, help="Total messages to send")
+    poison.add_argument("--poison-count", type=int, default=2, help="Number of poison messages")
+    poison.add_argument(
+        "--idle-timeout",
+        type=int,
+        default=30,
+        help="Idle timeout for consumer to exit when queue is drained",
+    )
+    poison.add_argument(
+        "--consumer-timeout",
+        type=int,
+        default=300,
+        help="Timeout (seconds) for consumer subprocess",
+    )
+    poison.add_argument(
+        "--queue-timeout",
+        type=int,
+        default=180,
+        help="Timeout (seconds) to wait for queue to drain",
+    )
+
     return parser.parse_args()
 
 
@@ -426,6 +549,7 @@ def main() -> None:
         "happy": scenario_happy,
         "crash": scenario_crash,
         "duplicates": scenario_duplicates,
+        "poison": scenario_poison,
     }.get(args.scenario)
 
     if not scenario_fn:

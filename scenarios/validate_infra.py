@@ -18,6 +18,7 @@ SCENARIO_TF_KEYS = {
     "happy": "happy",
     "crash": "crash",
     "duplicates": "dup",
+    "poison": "poison",
 }
 
 

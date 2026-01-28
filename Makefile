@@ -1,5 +1,5 @@
 .PHONY: help preflight infra-up infra-down infra-validate validate \
-       scenario-happy scenario-crash scenario-duplicates scenarios venv
+       scenario-happy scenario-crash scenario-duplicates scenario-poison scenarios venv
 
 ARGS ?=
 
@@ -70,4 +70,7 @@ scenario-crash: $(VENV_STAMP) ## Run the crash scenario
 scenario-duplicates: $(VENV_STAMP) ## Run the duplicates scenario
 	$(VENV)/bin/python scenarios/run.py duplicates $(ARGS)
 
-scenarios: scenario-happy scenario-crash scenario-duplicates ## Run all scenarios in sequence
+scenario-poison: $(VENV_STAMP) ## Run the poison message scenario
+	$(VENV)/bin/python scenarios/run.py poison $(ARGS)
+
+scenarios: scenario-happy scenario-crash scenario-duplicates scenario-poison ## Run all scenarios in sequence

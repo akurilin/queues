@@ -228,6 +228,8 @@ def main() -> None:
     message_limit = env_int("MESSAGE_LIMIT", 0)  # Optional stop-after-N for tests
     # Optional idle timeout: exit if no messages arrive for this many seconds (0 = disabled)
     idle_timeout_seconds = env_int("IDLE_TIMEOUT_SECONDS", 0)
+    # Optional payload marker to reject messages (for poison message testing)
+    reject_payload_marker = os.getenv("REJECT_PAYLOAD_MARKER", "")
 
     # Log startup configuration so user knows what behavior is enabled
     logger.info(
@@ -335,6 +337,7 @@ def main() -> None:
                         is_duplicate,
                         remember_message_id,
                         dynamo_tracker,
+                        reject_payload_marker,
                     )
                     # Check if we've hit the optional message limit (for testing)
                     if message_limit and processed_count >= message_limit:
@@ -376,6 +379,7 @@ def handle_message(
     is_duplicate: Callable[[str], bool],
     remember_message_id: Callable[[str], None],
     dynamo_tracker: Optional[DynamoTracker],
+    reject_payload_marker: str = "",
 ) -> None:
     """Process a single message with optional chaos behaviors."""
     # Extract raw message body from SQS message structure
@@ -404,6 +408,10 @@ def handle_message(
             if message_id:
                 remember_message_id(message_id)
             return
+
+    # Reject poison messages (marker found in raw body)
+    if reject_payload_marker and reject_payload_marker in body_raw:
+        raise ValueError(f"Poison message rejected (marker={reject_payload_marker!r}, id={message_id})")
 
     # Check if this message has been processed before (idempotency check)
     if message_id and is_duplicate(message_id):
