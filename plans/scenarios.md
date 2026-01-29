@@ -3,7 +3,7 @@
 This file captures the agreed plan, schemas, and Terraform sketch so work can be resumed without the prior conversation. No changes have been applied yet—this is a blueprint.
 
 ## Goals
-- Add runnable scenarios to exercise SQS queue behaviors (happy path + 9 deviations) using existing producer/consumer scripts.
+- Add runnable scenarios to exercise SQS queue behaviors (happy path, failure modes, and diagnostic scenarios) using existing producer/consumer scripts.
 - Keep AWS costs low (small message counts; short runs; on-demand DynamoDB; minimal ECS scale).
 - Provide a Python-based runner to orchestrate scenarios and assert PASS/FAIL.
 - Extend infrastructure with DynamoDB side-effect tables and ECS autoscaling on SQS backlog.
@@ -59,6 +59,9 @@ This file captures the agreed plan, schemas, and Terraform sketch so work can be
     - Message visibility state
 
     **Our mitigation**: The scenario runner waits 60s after any purge before sending new messages. When no purge is needed (queue already empty), it waits 10s as a safety buffer in case a previous run's purge is still active.
+
+12) **DLQ Redrive / Replay**
+    The poison scenario shows messages landing in the DLQ, but that's only half the story. In production, you need to handle DLQ messages: investigate, fix the issue, and replay them. AWS provides `StartMessageMoveTask` to redrive messages from DLQ back to the source queue, but there are operational considerations: What if the fix isn't deployed yet and they fail again? Should you replay all at once or in batches? How do you track which messages were replayed and their outcomes? Some teams use a quarantine pattern — messages that fail twice go to a separate quarantine queue for manual review. This scenario demonstrates the full operational lifecycle: messages fail → land in DLQ → fix is applied → redrive to source queue → messages process successfully. Assert that redriven messages are processed, idempotency holds (no duplicate side effects from earlier failed attempts), and the DLQ is empty after successful replay.
 
 ## Code Changes Needed (not yet applied)
 - **Consumer (`consumer/consume.py`)**
@@ -190,6 +193,7 @@ This file captures the agreed plan, schemas, and Terraform sketch so work can be
 - **9 Out-of-Order**: Producer sends sequenced events (v1, v2, v3); consumer receives them out of order; assert final state is correct using version/timestamp reconciliation logic.
 - **10 Backlog Drain**: Consumer is offline while producer sends a large burst; consumer(s) come back online and drain the backlog; assert all messages processed, idempotency holds under load, no messages lost.
 - **11 Purge Timing**: ✅ Diagnostic scenario to verify SQS purge behavior. Runs multiple iterations sending messages at various delays after purge (0s, 5s, 15s, 30s, 45s, 60s, 65s). Documents that purge timing is non-deterministic but messages after 60s are safe.
+- **12 DLQ Redrive**: Poison messages land in DLQ; apply fix; use `StartMessageMoveTask` to redrive back to source queue; assert messages process successfully, idempotency holds, DLQ empties.
 
 ## Why Python Runner (vs. shell)
 - Shell + `aws`/`jq` can work but gets unwieldy for waits/assertions and DynamoDB condition logic. Python can reuse boto3, cleanly express assertions, and handle retries.

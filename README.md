@@ -1,10 +1,27 @@
-# SQS Demo
+# Queue Fundamentals with AWS SQS
 
-Minimal-but-complete SQS workflow. Entirely vibe-coded. Terraform creates per-scenario resources:
-- SQS standard queue + dead-letter queue (DLQ) for each of 5 scenarios
-- Two DynamoDB tables per scenario (`message-status`, `message-side-effects`) for idempotency and per-message state tracking
+Infrastructure + scenario runner showcasing happy paths and many failure modes of working with queues in distributed systems
 
-Consumers and producers both run locally (no ECS/Fargate/Docker needed).
+## Scenarios
+`scenarios/` contains self-contained setups to exercise typical queue behaviors. Each scenario uses its own isolated SQS queue + DLQ and DynamoDB tables, all provisioned by the shared `terraform/` configuration. Consumers and producers run as local Python subprocesses.
+
+**Fast** (finish in seconds):
+- **Happy path** (`make scenario-happy`): messages flow through cleanly, all processed and deleted.
+- **Crash recovery** (`make scenario-crash`): consumer crashes after receiving; observe redelivery and recovery.
+- **Duplicate delivery** (`make scenario-duplicates`): slow processing triggers visibility timeout, causing redelivery; DynamoDB-backed idempotency prevents duplicate side effects.
+- **Poison messages** (`make scenario-poison`): messages with a poison marker are rejected and redrive to the DLQ after max retries.
+- **Partial batch failure** (`make scenario-partial-batch`): consumer receives batches of 10 messages containing both good and poison messages; good messages are processed and deleted individually while poison messages are retried and eventually land in the DLQ.
+- **External side effects** (`make scenario-side-effects`): consumer uses the check-before-doing pattern to handle external side effects; proves no duplicate side effects occur even when crashing after the side effect but before updating status.
+- **Graceful shutdown** (`make scenario-graceful-shutdown`): consumer receives SIGTERM mid-processing and finishes in-flight work before exiting cleanly.
+
+**Slow** (5–10 minutes):
+- **Backpressure / auto-scaling** (`make scenario-backpressure`): a continuous producer floods the queue; the runner monitors queue depth and spawns additional consumers until equilibrium.
+- **Purge timing** (`make scenario-purge-timing`): diagnostic scenario verifying SQS's 60-second async purge behavior and documenting the danger window for message loss.
+
+**Not yet implemented:**
+- **Out-of-order processing**: demonstrate that standard SQS makes no ordering guarantees; show version/timestamp reconciliation for correct final state.
+- **Backlog drain after outage**: consumer offline while messages pile up; verify burst recovery, idempotency under load, and stale message handling.
+- **DLQ redrive**: messages fail and land in DLQ; apply fix; use `StartMessageMoveTask` to replay; verify successful processing and empty DLQ.
 
 ## Repo layout
 
@@ -14,7 +31,7 @@ Consumers and producers both run locally (no ECS/Fargate/Docker needed).
 | `producer/` | Local Python script to enqueue synthetic messages with batching and rate limiting |
 | `scripts/` | Build/push helper (`build_and_push.sh`), producer wrapper (`run_producer.sh`), env loader (`set_env.sh`) |
 | `terraform/` | Infrastructure definitions with local state |
-| `scenarios/` | 5 self-contained runnable scenarios exercising queue behaviors |
+| `scenarios/` | Self-contained runnable scenarios exercising queue behaviors |
 | `plans/` | Planning/design documents |
 
 ## Prerequisites
@@ -136,26 +153,14 @@ Each message contains a JSON payload with a UUID `id` and a random `work` value 
 | `queue_visibility_timeout` | `10` | SQS visibility timeout (seconds) |
 | `queue_receive_wait` | `10` | SQS long-poll wait time (seconds) |
 
-## Scenarios
-`scenarios/` contains self-contained setups to exercise typical queue behaviors. Each scenario uses its own isolated SQS queue + DLQ and DynamoDB tables, all provisioned by the shared `terraform/` configuration. Consumers and producers run as local Python subprocesses.
 
-**Fast** (finish in seconds):
-- **Happy path** (`make scenario-happy`): messages flow through cleanly, all processed and deleted.
-- **Crash recovery** (`make scenario-crash`): consumer crashes after receiving; observe redelivery and recovery.
-- **Duplicate delivery** (`make scenario-duplicates`): slow processing triggers visibility timeout, causing redelivery; DynamoDB-backed idempotency prevents duplicate side effects.
-- **Poison messages** (`make scenario-poison`): messages with a poison marker are rejected and redrive to the DLQ after max retries.
-- **Partial batch failure** (`make scenario-partial-batch`): consumer receives batches of 10 messages containing both good and poison messages; good messages are processed and deleted individually while poison messages are retried and eventually land in the DLQ.
-- **External side effects** (`make scenario-side-effects`): consumer uses the check-before-doing pattern to handle external side effects; proves no duplicate side effects occur even when crashing after the side effect but before updating status.
-
-**Slow** (5–10 minutes):
-- **Backpressure / auto-scaling** (`make scenario-backpressure`): a continuous producer floods the queue; the runner monitors queue depth and spawns additional consumers until equilibrium.
 
 ### Running scenarios
 - **Prereqs**: infrastructure provisioned (`make infra-up`), AWS CLI + Terraform on PATH.
 - **Quick start** (venv is created automatically):
   ```bash
-  make scenarios-fast        # run the 6 fast scenarios
-  make scenarios-slow        # run slow scenarios (backpressure)
+  make scenarios-fast        # run fast scenarios
+  make scenarios-slow        # run slow scenarios
   make scenarios             # run everything (fast then slow)
   ```
 - **Individual scenarios**:
@@ -185,8 +190,8 @@ Run `make help` to see all targets. Key ones:
 | `make venv` | Create/update the project venv |
 | `make validate` | Validate scenario infrastructure is healthy |
 | `make scenario-*` | Run individual scenarios |
-| `make scenarios-fast` | Run the 6 fast scenarios |
-| `make scenarios-slow` | Run slow scenarios (backpressure) |
+| `make scenarios-fast` | Run fast scenarios |
+| `make scenarios-slow` | Run slow scenarios |
 | `make scenarios` | Run all scenarios (fast then slow) |
 
 ## Tear down
