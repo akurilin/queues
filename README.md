@@ -2,7 +2,7 @@
 
 Minimal-but-complete SQS workflow. Entirely vibe-coded. Terraform creates per-scenario resources:
 - SQS standard queue + dead-letter queue (DLQ) for each of 5 scenarios
-- Two DynamoDB tables per scenario (`message-status`, `message-completed`) for idempotency and per-message state tracking
+- Two DynamoDB tables per scenario (`message-status`, `message-side-effects`) for idempotency and per-message state tracking
 
 Consumers and producers both run locally (no ECS/Fargate/Docker needed).
 
@@ -28,7 +28,7 @@ Consumers and producers both run locally (no ECS/Fargate/Docker needed).
    ```bash
    make infra-up
    ```
-   This writes a `.env` at repo root with `QUEUE_URL`, `DLQ_ARN`, `AWS_REGION`, `MESSAGE_STATUS_TABLE`, and `MESSAGE_COMPLETED_TABLE` (pointing at the happy-path resources for ad-hoc testing).
+   This writes a `.env` at repo root with `QUEUE_URL`, `DLQ_ARN`, `AWS_REGION`, `MESSAGE_STATUS_TABLE`, and `MESSAGE_SIDE_EFFECTS_TABLE` (pointing at the happy-path resources for ad-hoc testing).
 
 2) **Run the producer locally to send messages**
    ```bash
@@ -73,7 +73,7 @@ Producer (local)  ──▶  SQS Queue  ──▶  Consumer (local)  ──▶  
                      Dead-Letter Queue (after 2 failed receives)
 ```
 
-- **Idempotency**: DynamoDB tables track message IDs. The `message-status` table records processing state (STARTED/COMPLETED) with attempt counts. The `message-completed` table provides a separate completion record for cross-consumer deduplication. The consumer also maintains an in-memory LRU cache for fast local duplicate detection.
+- **Idempotency**: DynamoDB tables track message IDs. The `message-status` table records processing state (STARTED/COMPLETED) with attempt counts. The `message-side-effects` table provides a separate completion record for cross-consumer deduplication. The consumer also maintains an in-memory LRU cache for fast local duplicate detection.
 - **Long-polling**: Consumer uses configurable wait time (default 10s) to reduce API calls.
 - **Batching**: Producer batches up to 10 messages per SQS API call.
 
@@ -90,20 +90,16 @@ Producer (local)  ──▶  SQS Queue  ──▶  Consumer (local)  ──▶  
 | `AWS_REGION` | SDK default | Region override |
 | `WAIT_TIME_SECONDS` | `10` | Long-poll wait (seconds) |
 | `MAX_MESSAGES` | `1` | Messages per receive call (capped at 10) |
-| `SLEEP_MIN_SECONDS` | `0.1` | Minimum simulated work duration |
-| `SLEEP_MAX_SECONDS` | `1.0` | Maximum simulated work duration |
-| `LONG_SLEEP_SECONDS` | `0.0` | Long sleep duration for visibility overrun simulation (0 = disabled) |
-| `LONG_SLEEP_EVERY` | `0` | Apply long sleep every Nth message (0 = disabled) |
 | `CRASH_RATE` | `0.0` | Probability (0–1) of random crash per message |
-| `CRASH_AFTER_RECEIVE` | `0` | If non-zero, crash deterministically after processing but before deleting |
+| `CRASH_AFTER_RECEIVE` | `0` | If non-zero, crash deterministically after receiving but before side effect |
 | `IDEMPOTENCY_CACHE_SIZE` | `1000` | In-memory LRU cache size for duplicate detection (0 = disabled) |
 | `MESSAGE_LIMIT` | `0` | Stop after processing N messages (0 = unlimited) |
 | `IDLE_TIMEOUT_SECONDS` | `0` | Exit if no messages arrive for this many seconds (0 = disabled) |
 | `REJECT_PAYLOAD_MARKER` | *(empty)* | Reject messages whose payload contains this marker (for poison message testing) |
-| `MESSAGE_STATUS_TABLE` | *(optional)* | DynamoDB table name for status tracking |
-| `MESSAGE_COMPLETED_TABLE` | *(optional)* | DynamoDB table name for completion idempotency |
-| `USE_TRANSACTIONAL_WRITES` | `0` | Use DynamoDB transactions for atomic side effect + idempotency writes |
-| `CRASH_AFTER_SIDE_EFFECT` | `0` | Crash after DynamoDB transaction but before SQS delete (for testing) |
+| `MESSAGE_STATUS_TABLE` | *(optional)* | DynamoDB table name for status tracking (our bookkeeping) |
+| `MESSAGE_SIDE_EFFECTS_TABLE` | *(optional)* | DynamoDB table name for side effects (simulates external service) |
+| `SIDE_EFFECT_DELAY_SECONDS` | `0.0` | Delay before side effect to simulate slow external service (for visibility timeout testing) |
+| `CRASH_AFTER_SIDE_EFFECT` | `0` | Crash after side effect but before marking complete (for testing idempotency) |
 | `LOG_LEVEL` | `INFO` | Logging level (DEBUG, INFO, WARNING, ERROR) |
 
 ## Producer usage
@@ -122,13 +118,13 @@ Producer (local)  ──▶  SQS Queue  ──▶  Consumer (local)  ──▶  
 Each message contains a JSON payload with a UUID `id` and a random `work` value (1–1000). Poison messages additionally carry `"poison": true`.
 
 ## Failure-mode experiments
-- **Visibility overrun**: `LONG_SLEEP_SECONDS=10 LONG_SLEEP_EVERY=2` — expect duplicates as messages become visible again before processing completes
 - **Crashy worker**: `CRASH_RATE=0.2` — consumer exits intermittently; messages redeliver from the queue
-- **Deterministic crash**: `CRASH_AFTER_RECEIVE=1` — crashes after processing but before delete, useful for testing redelivery
+- **Crash before side effect**: `CRASH_AFTER_RECEIVE=1` — crashes after receiving but before performing side effect
+- **Crash after side effect**: `CRASH_AFTER_SIDE_EFFECT=1` — crashes after side effect but before marking complete; tests the check-before-doing pattern
 - **Burst load**: `./scripts/run_producer.sh --n 1000 --rate 0` — observe SQS metrics and processing throughput
 
 ## Environment config
-- Terraform writes a `.env` at repo root with `QUEUE_URL`, `DLQ_ARN`, `AWS_REGION`, `MESSAGE_STATUS_TABLE`, and `MESSAGE_COMPLETED_TABLE` (using the happy-path scenario resources).
+- Terraform writes a `.env` at repo root with `QUEUE_URL`, `DLQ_ARN`, `AWS_REGION`, `MESSAGE_STATUS_TABLE`, and `MESSAGE_SIDE_EFFECTS_TABLE` (using the happy-path scenario resources).
 - If you prefer manual setup, copy `.env.example` to `.env` and fill in your account-specific values; scripts/loaders will pick it up.
 
 ## Terraform variables
@@ -149,7 +145,7 @@ Each message contains a JSON payload with a UUID `id` and a random `work` value 
 - **Duplicate delivery** (`make scenario-duplicates`): slow processing triggers visibility timeout, causing redelivery; DynamoDB-backed idempotency prevents duplicate side effects.
 - **Poison messages** (`make scenario-poison`): messages with a poison marker are rejected and redrive to the DLQ after max retries.
 - **Partial batch failure** (`make scenario-partial-batch`): consumer receives batches of 10 messages containing both good and poison messages; good messages are processed and deleted individually while poison messages are retried and eventually land in the DLQ.
-- **Transactional side effects** (`make scenario-side-effects`): consumer uses DynamoDB transactions to atomically write the side effect and idempotency record; proves no duplicate side effects occur even when crashing after the transaction but before SQS delete.
+- **External side effects** (`make scenario-side-effects`): consumer uses the check-before-doing pattern to handle external side effects; proves no duplicate side effects occur even when crashing after the side effect but before updating status.
 
 **Slow** (5–10 minutes):
 - **Backpressure / auto-scaling** (`make scenario-backpressure`): a continuous producer floods the queue; the runner monitors queue depth and spawns additional consumers until equilibrium.
@@ -204,33 +200,49 @@ make infra-down
 
 This section documents deeper design considerations that emerged from building and testing these scenarios.
 
-### The Two-Table Idempotency Pattern
+### The Two-Table Pattern for External Side Effects
 
-This codebase uses two DynamoDB tables for idempotency, each with a distinct role:
+This codebase uses two DynamoDB tables to model how production systems handle external side effects (like calling Stripe, sending emails, etc.) that cannot be transacted with your own database:
 
-| Table | Role | Key insight |
-|-------|------|-------------|
-| `message_status` | **The side effect** — tracks processing lifecycle (STARTED → COMPLETED) | Updating this to COMPLETED *is* the durable business outcome we care about |
-| `message_completed` | **The idempotency gate** — written with `attribute_not_exists` condition | If this write fails, we know the message was already processed |
+| Table | Role | Real-world analogy |
+|-------|------|-------------------|
+| `message_side_effects` | **The external side effect** — represents the external service's record | Stripe's ledger saying "$50 was transferred" |
+| `message_status` | **Our bookkeeping** — tracks that we confirmed the side effect happened | Our database saying "we verified Stripe did the transfer" |
 
-**Why two tables instead of one?**
+**The check-before-doing pattern:**
 
-You could use a single table, but the two-table pattern provides:
-1. **Separation of concerns**: Status tracking (with attempt counts, timestamps) vs. simple "was this done?" check
-2. **Defense in depth**: `mark_started()` checks status first (fast path), transaction catches anything that slips through
-3. **Clear semantics**: The completion table is append-only and authoritative; status table can be updated multiple times
+```
+1. mark_started() → record STARTED in status table
+2. CHECK: does message_id exist in side_effects table?
+   - If YES → side effect already done, skip to step 5
+3. DO SIDE EFFECT: write to side_effects table (simulates external call)
+4. [crash possible here]
+5. Update status to COMPLETED (our bookkeeping)
+6. Delete from SQS
+```
 
-**Transactional mode (`USE_TRANSACTIONAL_WRITES=1`)**
+**Why this matters:**
 
-When enabled, the consumer uses `TransactWriteItems` to atomically:
-1. Update `message_status` to COMPLETED (the side effect)
-2. Write to `message_completed` with condition (the idempotency gate)
+You can't transact with external systems. When you call Stripe, you can't wrap that HTTP call in a database transaction. So if you crash after Stripe charges the card but before you update your records, you need a way to know "did the charge already happen?" on retry.
 
-If we crash after the transaction but before SQS delete, the message gets redelivered. On redelivery, the transaction fails because `message_completed` already exists — and crucially, this also rolls back the status update, so we don't record a duplicate side effect.
+The `message_side_effects` table simulates this — it's the "external system's record" of what happened. On retry, you check it first to avoid duplicate side effects.
+
+### What Happens on Crash + Retry
+
+If the consumer crashes between steps 3 and 5:
+1. Side effect is recorded (Stripe charged the card)
+2. But our status table doesn't know yet
+3. Message becomes visible again in SQS
+4. New consumer picks it up
+5. Step 2 check sees side effect exists → **skips the external call**
+6. Updates status to COMPLETED
+7. Deletes from SQS
+
+No duplicate charge. The pattern works because we **check before doing**.
 
 ### Side Effects Across Multiple External Systems
 
-When your consumer needs to write to multiple systems (e.g., charge via Stripe, send an email, update a database), you can't wrap everything in a single transaction. A DynamoDB transaction can't include an HTTP call to Stripe.
+When your consumer needs to write to multiple systems (e.g., charge via Stripe, send an email, update a database), you can't wrap everything in a single transaction.
 
 **Common patterns:**
 
@@ -251,7 +263,7 @@ There are two distinct duplication problems:
 | **Delivery idempotency** | SQS redelivers the same message (visibility timeout, crash before delete) | Dedupe on `message_id` — the ID the producer assigned to the message |
 | **Business idempotency** | Producer sends the same logical work twice with different message IDs (user double-clicks, retry logic, bugs) | Dedupe on a business key like `order_id` or `payment_intent_id` |
 
-This demo implements delivery idempotency: the `message_completed` table is keyed on `message_id`, which the producer generates as a UUID. If the same message is redelivered, the conditional write fails and we skip reprocessing.
+This demo implements delivery idempotency: the `message_side_effects` table is keyed on `message_id`, which the producer generates as a UUID. If the same message is redelivered, the check-before-doing pattern skips the side effect.
 
 But if the producer sends two messages with different UUIDs that both say "charge order-123", the consumer will process both — because they have different `message_id` values. To catch this, you need the producer to include a business-level idempotency key in the payload:
 

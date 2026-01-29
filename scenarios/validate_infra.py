@@ -60,12 +60,12 @@ def validate_sqs_queue(session: boto3.Session, queue_url: str, dlq_arn: str) -> 
 
 
 def validate_dynamodb_tables(
-    session: boto3.Session, status_table: str, completed_table: str
+    session: boto3.Session, status_table: str, side_effects_table: str
 ) -> None:
     """Check that both DynamoDB tables exist with expected key schema."""
     dynamo = session.client("dynamodb")
 
-    for table_name in (status_table, completed_table):
+    for table_name in (status_table, side_effects_table):
         desc = dynamo.describe_table(TableName=table_name)["Table"]
         keys = {k["AttributeName"]: k["KeyType"] for k in desc["KeySchema"]}
         if keys.get("message_id") != "HASH":
@@ -86,7 +86,7 @@ def validate_scenario_infra(
 
     validate_sqs_queue(session, outputs["queue_url"], outputs["dlq_arn"])
     validate_dynamodb_tables(
-        session, outputs["message_status_table"], outputs["message_completed_table"]
+        session, outputs["message_status_table"], outputs["message_side_effects_table"]
     )
 
     print("[validate] All checks passed.")
@@ -119,7 +119,7 @@ def main() -> None:
             "queue_url": resources["queue_url"],
             "dlq_arn": resources["dlq_arn"],
             "message_status_table": resources["message_status_table"],
-            "message_completed_table": resources["message_completed_table"],
+            "message_side_effects_table": resources["message_side_effects_table"],
         }
         print(f"[validate] Checking {scenario_name} ({tf_key}) ...")
         validate_scenario_infra(outputs, region, args.profile)

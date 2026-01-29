@@ -181,7 +181,7 @@ def cleanup_scenario_state(
     purged_primary = purge_queue(sqs, queue_url, "primary")
     purged_dlq = purge_queue(sqs, dlq_url, "DLQ")
     clear_dynamo_table(dynamo_resource, outputs["message_status_table"])
-    clear_dynamo_table(dynamo_resource, outputs["message_completed_table"])
+    clear_dynamo_table(dynamo_resource, outputs["message_side_effects_table"])
     if purged_primary or purged_dlq:
         print(f"[{label}] Waiting 60s for SQS purge to complete ...")
         time.sleep(60)
@@ -464,7 +464,7 @@ def scenario_duplicates(args: argparse.Namespace, outputs: Dict) -> None:
     region = outputs["aws_region"]
     profile = os.environ.get("AWS_PROFILE", "")
     status_table_name = outputs["message_status_table"]
-    completed_table_name = outputs["message_completed_table"]
+    completed_table_name = outputs["message_side_effects_table"]
 
     dlq_url = queue_url_from_arn(outputs["dlq_arn"])
     sqs = build_sqs_client(region, profile)
@@ -481,9 +481,8 @@ def scenario_duplicates(args: argparse.Namespace, outputs: Dict) -> None:
 
     common_env = {
         "MESSAGE_STATUS_TABLE": status_table_name,
-        "MESSAGE_COMPLETED_TABLE": completed_table_name,
-        "LONG_SLEEP_SECONDS": str(args.slow_seconds),
-        "LONG_SLEEP_EVERY": "1",
+        "MESSAGE_SIDE_EFFECTS_TABLE": completed_table_name,
+        "SIDE_EFFECT_DELAY_SECONDS": str(args.slow_seconds),
         "MESSAGE_LIMIT": "1",
         "IDLE_TIMEOUT_SECONDS": str(args.idle_timeout),
         "LOG_LEVEL": "INFO",
@@ -564,9 +563,9 @@ def scenario_poison(args: argparse.Namespace, outputs: Dict) -> None:
         "MAX_MESSAGES": "1",
         "WAIT_TIME_SECONDS": "5",
     }
-    if outputs.get("message_status_table") and outputs.get("message_completed_table"):
+    if outputs.get("message_status_table") and outputs.get("message_side_effects_table"):
         consumer_env["MESSAGE_STATUS_TABLE"] = outputs["message_status_table"]
-        consumer_env["MESSAGE_COMPLETED_TABLE"] = outputs["message_completed_table"]
+        consumer_env["MESSAGE_SIDE_EFFECTS_TABLE"] = outputs["message_side_effects_table"]
 
     exit_code = run_local_consumer(env=consumer_env, timeout=args.consumer_timeout)
     if exit_code != 0:
@@ -599,7 +598,7 @@ def scenario_partial_batch(args: argparse.Namespace, outputs: Dict) -> None:
     region = outputs["aws_region"]
     profile = os.environ.get("AWS_PROFILE", "")
     dlq_url = queue_url_from_arn(outputs["dlq_arn"])
-    completed_table_name = outputs["message_completed_table"]
+    completed_table_name = outputs["message_side_effects_table"]
     sqs = build_sqs_client(region, profile)
     dynamo = build_dynamo_resource(region, profile)
     cleanup_scenario_state(sqs, dynamo, outputs, "partial-batch")
@@ -635,9 +634,9 @@ def scenario_partial_batch(args: argparse.Namespace, outputs: Dict) -> None:
         "MAX_MESSAGES": "10",
         "WAIT_TIME_SECONDS": "5",
     }
-    if outputs.get("message_status_table") and outputs.get("message_completed_table"):
+    if outputs.get("message_status_table") and outputs.get("message_side_effects_table"):
         consumer_env["MESSAGE_STATUS_TABLE"] = outputs["message_status_table"]
-        consumer_env["MESSAGE_COMPLETED_TABLE"] = outputs["message_completed_table"]
+        consumer_env["MESSAGE_SIDE_EFFECTS_TABLE"] = outputs["message_side_effects_table"]
 
     exit_code = run_local_consumer(env=consumer_env, timeout=args.consumer_timeout)
     if exit_code != 0:
@@ -678,23 +677,34 @@ def scenario_partial_batch(args: argparse.Namespace, outputs: Dict) -> None:
 
 
 def scenario_side_effects(args: argparse.Namespace, outputs: Dict) -> None:
-    """Scenario 6: Transactional side effects — prove that atomic DynamoDB
-    transactions prevent duplicate side effects even when crashes occur.
+    """Scenario 6: External side effects — prove that the check-before-doing
+    pattern prevents duplicate side effects even when crashes occur.
 
-    The consumer uses TransactWriteItems to atomically:
-    1. Update message_status to COMPLETED (the side effect)
-    2. Write to message_completed with condition (the idempotency gate)
+    The consumer uses a two-table pattern:
+    1. message_side_effects: represents the external side effect (like Stripe)
+    2. message_status: our bookkeeping that we confirmed the side effect
 
-    If we crash after the transaction but before SQS delete, the message gets
-    redelivered. On redelivery, the idempotency check fails and the entire
-    transaction rolls back — no duplicate side effect.
+    Flow:
+    1. Check if side effect exists in message_side_effects
+    2. If not, perform the side effect (write to message_side_effects)
+    3. [crash here — CRASH_AFTER_SIDE_EFFECT tests this]
+    4. Update message_status to COMPLETED
+    5. Delete from SQS
+
+    On retry after crash:
+    1. Check side_effects table → exists → skip the external call
+    2. Update status to COMPLETED
+    3. Delete from SQS
+
+    This models real external systems (Stripe, email, etc.) where you can't
+    transact with the external service — you must check before doing.
     """
     queue_url = outputs["queue_url"]
     region = outputs["aws_region"]
     profile = os.environ.get("AWS_PROFILE", "")
     dlq_url = queue_url_from_arn(outputs["dlq_arn"])
     status_table_name = outputs["message_status_table"]
-    completed_table_name = outputs["message_completed_table"]
+    side_effects_table_name = outputs["message_side_effects_table"]
     sqs = build_sqs_client(region, profile)
     dynamo = build_dynamo_resource(region, profile)
     cleanup_scenario_state(sqs, dynamo, outputs, "side-effects")
@@ -712,15 +722,15 @@ def scenario_side_effects(args: argparse.Namespace, outputs: Dict) -> None:
     print("[side-effects] Confirming messages are enqueued ...")
     wait_for_messages_enqueued(sqs, queue_url, message_count)
 
-    # Phase 1: Run consumer with transactional writes + crash after side effect
-    # This processes messages, writes to DynamoDB, then crashes before delete
-    print("[side-effects] Running consumer with USE_TRANSACTIONAL_WRITES=1, CRASH_AFTER_SIDE_EFFECT=1 ...")
+    # Phase 1: Run consumer with crash after side effect
+    # This performs the side effect (writes to side_effects table), then crashes
+    # before updating status or deleting from SQS
+    print("[side-effects] Running consumer with CRASH_AFTER_SIDE_EFFECT=1 ...")
     consumer_env = {
         "QUEUE_URL": queue_url,
         "AWS_REGION": region,
         "MESSAGE_STATUS_TABLE": status_table_name,
-        "MESSAGE_COMPLETED_TABLE": completed_table_name,
-        "USE_TRANSACTIONAL_WRITES": "1",
+        "MESSAGE_SIDE_EFFECTS_TABLE": side_effects_table_name,
         "CRASH_AFTER_SIDE_EFFECT": "1",
         "IDLE_TIMEOUT_SECONDS": "10",
         "LOG_LEVEL": "INFO",
@@ -740,15 +750,14 @@ def scenario_side_effects(args: argparse.Namespace, outputs: Dict) -> None:
     print(f"[side-effects] Waiting {args.visibility_wait}s for visibility timeout ...")
     time.sleep(args.visibility_wait)
 
-    # Phase 3: Run consumer normally (still transactional) to handle redeliveries
-    # The transaction should fail on redelivery due to idempotency check
+    # Phase 3: Run consumer normally to handle redeliveries
+    # The consumer should detect that side effects already exist and skip them
     print("[side-effects] Running consumer to handle redeliveries ...")
     consumer_env_normal = {
         "QUEUE_URL": queue_url,
         "AWS_REGION": region,
         "MESSAGE_STATUS_TABLE": status_table_name,
-        "MESSAGE_COMPLETED_TABLE": completed_table_name,
-        "USE_TRANSACTIONAL_WRITES": "1",
+        "MESSAGE_SIDE_EFFECTS_TABLE": side_effects_table_name,
         "IDLE_TIMEOUT_SECONDS": str(args.idle_timeout),
         "LOG_LEVEL": "INFO",
         "MAX_MESSAGES": "1",
@@ -763,20 +772,20 @@ def scenario_side_effects(args: argparse.Namespace, outputs: Dict) -> None:
     wait_for_queue_empty(sqs, queue_url, timeout=args.queue_timeout)
 
     # Phase 4: Assertions
-    # Check that message_completed has exactly message_count entries (no duplicates)
-    completed_table = dynamo.Table(completed_table_name)
-    completed_count = 0
+    # Check that message_side_effects has exactly message_count entries (no duplicates)
+    side_effects_table = dynamo.Table(side_effects_table_name)
+    side_effects_count = 0
     scan_kw: Dict = {"Select": "COUNT"}
     while True:
-        resp = completed_table.scan(**scan_kw)
-        completed_count += resp["Count"]
+        resp = side_effects_table.scan(**scan_kw)
+        side_effects_count += resp["Count"]
         if "LastEvaluatedKey" not in resp:
             break
         scan_kw["ExclusiveStartKey"] = resp["LastEvaluatedKey"]
 
-    if completed_count != message_count:
+    if side_effects_count != message_count:
         raise RuntimeError(
-            f"Expected {message_count} completion records, found {completed_count}. "
+            f"Expected {message_count} side effect records, found {side_effects_count}. "
             "Duplicate side effects may have occurred!"
         )
 
@@ -803,7 +812,7 @@ def scenario_side_effects(args: argparse.Namespace, outputs: Dict) -> None:
 
     print(
         f"[side-effects] PASS | {message_count} messages processed, "
-        f"{completed_count} unique completions (no duplicates)"
+        f"{side_effects_count} unique side effects (no duplicates)"
     )
 
 
@@ -823,7 +832,7 @@ def scenario_backpressure(args: argparse.Namespace, outputs: Dict) -> None:
     profile = os.environ.get("AWS_PROFILE", "")
     dlq_url = queue_url_from_arn(outputs["dlq_arn"])
     status_table_name = outputs["message_status_table"]
-    completed_table_name = outputs["message_completed_table"]
+    completed_table_name = outputs["message_side_effects_table"]
     sqs = build_sqs_client(region, profile)
     dynamo = build_dynamo_resource(region, profile)
     cleanup_scenario_state(sqs, dynamo, outputs, "backpressure")
@@ -836,9 +845,8 @@ def scenario_backpressure(args: argparse.Namespace, outputs: Dict) -> None:
         "QUEUE_URL": queue_url,
         "AWS_REGION": region,
         "MESSAGE_STATUS_TABLE": status_table_name,
-        "MESSAGE_COMPLETED_TABLE": completed_table_name,
-        "SLEEP_MIN_SECONDS": "1.0",
-        "SLEEP_MAX_SECONDS": "1.0",
+        "MESSAGE_SIDE_EFFECTS_TABLE": completed_table_name,
+        "SIDE_EFFECT_DELAY_SECONDS": "1.0",
         "IDLE_TIMEOUT_SECONDS": str(args.idle_timeout),
         "LOG_LEVEL": "WARNING",
         "MAX_MESSAGES": "1",
@@ -1103,7 +1111,7 @@ def parse_args() -> argparse.Namespace:
     )
 
     side = subparsers.add_parser(
-        "side-effects", help="Transactional side effects scenario (atomic writes prevent duplicates)"
+        "side-effects", help="External side effects scenario (check-before-doing prevents duplicates)"
     )
     side.add_argument("--count", type=int, default=5, help="Messages to send")
     side.add_argument(
@@ -1191,7 +1199,7 @@ def main() -> None:
         "queue_url": scenario_resources["queue_url"],
         "dlq_arn": scenario_resources["dlq_arn"],
         "message_status_table": scenario_resources["message_status_table"],
-        "message_completed_table": scenario_resources["message_completed_table"],
+        "message_side_effects_table": scenario_resources["message_side_effects_table"],
         "aws_region": region,
     }
 

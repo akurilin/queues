@@ -64,17 +64,6 @@ def build_dynamo_resource(region: Optional[str]) -> Any:
     return session.resource("dynamodb")
 
 
-def build_dynamo_client(region: Optional[str]) -> Any:
-    """Create a boto3 DynamoDB client scoped to the given region.
-
-    Note: We use a dedicated client (not resource.meta.client) for
-    transact_write_items because the resource's internal client has
-    different serialization behavior that causes key validation errors.
-    """
-    session = boto3.Session(region_name=region)
-    return session.client("dynamodb")
-
-
 def now_iso() -> str:
     """UTC timestamp for table writes."""
     return datetime.utcnow().replace(tzinfo=timezone.utc).isoformat()
@@ -92,56 +81,52 @@ def payload_digest(payload: Any) -> str:
 class DynamoTracker:
     """DynamoDB-backed idempotency using a two-table pattern.
 
-    ## Two-Table Idempotency Pattern
+    ## Two-Table Pattern for External Side Effects
 
-    This class uses two DynamoDB tables with distinct roles:
+    This class models how production systems handle external side effects
+    (like calling Stripe, sending emails, etc.) that cannot be transacted
+    with your own database.
 
-    ### message_status (The Side Effect / Processing State)
-    - Tracks the processing lifecycle: STARTED → COMPLETED or FAILED
-    - Records attempt counts for observability
-    - In transactional mode, updating this to COMPLETED is the "side effect"
-      that we want to happen exactly once
+    ### message_side_effects (The External Side Effect)
+    - Represents the external side effect itself (e.g., "Stripe recorded a $50 transfer")
+    - Writing to this table simulates calling an external service
+    - Once written, the side effect "happened" — you can't undo it
+    - Check this table BEFORE attempting the side effect to avoid duplicates
 
-    ### message_completed (The Idempotency Gate)
-    - A simple table with just message_id as the key
-    - Written with `attribute_not_exists(message_id)` condition
-    - If the write fails, we know this message was already processed
-    - This is the authoritative "was this done?" check
+    ### message_status (Our Bookkeeping)
+    - Tracks our orchestrator's knowledge: "we confirmed the side effect happened"
+    - Updated to COMPLETED after we verify the side effect succeeded
+    - If we crash between side effect and status update, retry will:
+      1. Check side_effects table → see it exists → skip the external call
+      2. Update status to COMPLETED
+      3. Delete from queue
 
-    ## Why Two Tables?
+    ## The Pattern
 
-    The two-table pattern provides defense in depth:
-    1. `mark_started()` checks if status is already COMPLETED (fast path)
-    2. `mark_completed_transactional()` uses a DynamoDB transaction to
-       atomically update status AND write the completion record
-    3. If we crash after the transaction but before SQS delete, the
-       redelivered message will be caught by either check
+    ```
+    1. mark_started() → record STARTED in status table
+    2. Check: does message_id exist in side_effects table?
+       - If YES → side effect already done, skip to step 4
+    3. DO SIDE EFFECT: write to side_effects table (simulates external call)
+    4. [crash possible here]
+    5. Update status to COMPLETED (our bookkeeping)
+    6. Delete from SQS
+    ```
 
-    ## Transactional vs Non-Transactional Mode
-
-    - **Non-transactional** (default): Two separate writes. A crash between
-      them could leave inconsistent state (status=COMPLETED but no completion
-      record, or vice versa).
-
-    - **Transactional** (USE_TRANSACTIONAL_WRITES=1): Both writes happen
-      atomically. Either both succeed or neither does. This guarantees the
-      "side effect" (status update) only happens if the idempotency gate
-      also succeeds.
+    This models real-world scenarios where you can't transact with external
+    systems. You must check before doing, and record after doing.
     """
 
     def __init__(
-        self, resource: Any, client: Any, status_table: str, completed_table: str
+        self, resource: Any, status_table: str, side_effects_table: str
     ) -> None:
         self.resource = resource
-        # Use a dedicated client for transact_write_items (not resource.meta.client)
-        # because the resource's internal client has different serialization behavior
-        self.client = client
-        # message_status: tracks processing lifecycle, serves as "side effect" in txn mode
+        # message_status: our bookkeeping of processing lifecycle
         self.status_table = resource.Table(status_table)
         self.status_table_name = status_table
-        # message_completed: idempotency gate with conditional writes
-        self.completed_table = resource.Table(completed_table)
-        self.completed_table_name = completed_table
+        # message_side_effects: represents the external side effect
+        self.side_effects_table = resource.Table(side_effects_table)
+        self.side_effects_table_name = side_effects_table
 
     @staticmethod
     def _is_conditional_failure(exc: ClientError) -> bool:
@@ -194,112 +179,74 @@ class DynamoTracker:
             return "completed"
         return "existing"
 
-    def mark_completed(self, message_id: str, payload: Any) -> str:
-        """Record completion with idempotent conditional writes."""
+    def check_side_effect_exists(self, message_id: str) -> bool:
+        """Check if the side effect was already performed.
+
+        This is the critical check-before-doing step. Before calling an
+        external service (or simulating one), check if we already did it.
+        """
+        try:
+            response = self.side_effects_table.get_item(Key={"message_id": message_id})
+            return "Item" in response
+        except ClientError as exc:
+            logger.warning("Failed to check side effect for %s: %s", message_id, exc)
+            return False
+
+    def do_side_effect(self, message_id: str, payload: Any) -> str:
+        """Perform the side effect (simulates calling an external service).
+
+        This represents the external call — like Stripe recording a transfer,
+        or an email service sending a message. Once this succeeds, the side
+        effect "happened" and cannot be undone.
+
+        Returns: "new" if side effect was performed, "already_done" if it existed
+        """
         timestamp = now_iso()
         digest = payload_digest(payload)
-        completion_recorded = False
 
         try:
-            self.completed_table.put_item(
+            self.side_effects_table.put_item(
                 Item={
                     "message_id": message_id,
-                    "processed_at": timestamp,
+                    "performed_at": timestamp,
                     "payload_digest": digest,
                 },
                 ConditionExpression="attribute_not_exists(message_id)",
             )
-            completion_recorded = True
+            logger.info("Side effect performed for message_id=%s", message_id)
+            return "new"
         except ClientError as exc:
-            if not self._is_conditional_failure(exc):
-                logger.warning("Failed to write completion for %s: %s", message_id, exc)
+            if self._is_conditional_failure(exc):
+                logger.info("Side effect already exists for message_id=%s", message_id)
+                return "already_done"
+            logger.warning("Failed to perform side effect for %s: %s", message_id, exc)
+            raise
+
+    def mark_completed(self, message_id: str) -> None:
+        """Update our bookkeeping to record that we confirmed the side effect.
+
+        This is called AFTER the side effect succeeds (or we verify it already
+        happened). It updates our status table to COMPLETED so we know we're done.
+        """
+        timestamp = now_iso()
 
         try:
             self.status_table.update_item(
                 Key={"message_id": message_id},
                 UpdateExpression=(
-                    "SET #s = :completed, attempts = if_not_exists(attempts, :zero) + :one, "
-                    "last_updated = :now, error_reason = :empty"
+                    "SET #s = :completed, "
+                    "last_updated = :now"
                 ),
                 ExpressionAttributeNames={"#s": "status"},
                 ExpressionAttributeValues={
                     ":completed": "COMPLETED",
-                    ":one": 1,
-                    ":zero": 0,
                     ":now": timestamp,
-                    ":empty": "",
                 },
                 ConditionExpression="attribute_exists(message_id)",
             )
         except ClientError as exc:
             if not self._is_conditional_failure(exc):
                 logger.warning("Failed to update status to COMPLETED for %s: %s", message_id, exc)
-
-        return "new_completion" if completion_recorded else "duplicate_completion"
-
-    def mark_completed_transactional(self, message_id: str, payload: Any) -> str:
-        """Record completion atomically using DynamoDB transactions.
-
-        This wraps both the side effect (updating message_status to COMPLETED)
-        and the idempotency gate (writing to message_completed) in a single
-        transaction. If the idempotency check fails, the entire transaction
-        rolls back — no partial writes.
-        """
-        timestamp = now_iso()
-        digest = payload_digest(payload)
-
-        transact_items = [
-            # The side effect: update status to COMPLETED
-            {
-                "Update": {
-                    "TableName": self.status_table_name,
-                    "Key": {"message_id": {"S": message_id}},
-                    "UpdateExpression": "SET #s = :completed, last_updated = :now",
-                    "ExpressionAttributeNames": {"#s": "status"},
-                    "ExpressionAttributeValues": {
-                        ":completed": {"S": "COMPLETED"},
-                        ":now": {"S": timestamp},
-                    },
-                    "ConditionExpression": "attribute_exists(message_id)",
-                }
-            },
-            # The idempotency gate: write completion record
-            {
-                "Put": {
-                    "TableName": self.completed_table_name,
-                    "Item": {
-                        "message_id": {"S": message_id},
-                        "processed_at": {"S": timestamp},
-                        "payload_digest": {"S": digest},
-                    },
-                    "ConditionExpression": "attribute_not_exists(message_id)",
-                }
-            },
-        ]
-
-        try:
-            self.client.transact_write_items(TransactItems=transact_items)
-            return "new_completion"
-        except ClientError as exc:
-            error_code = exc.response.get("Error", {}).get("Code", "")
-            if error_code == "TransactionCanceledException":
-                # Check cancellation reasons to determine if it was the idempotency check
-                reasons = exc.response.get("CancellationReasons", [])
-                for reason in reasons:
-                    if reason.get("Code") == "ConditionalCheckFailed":
-                        logger.info(
-                            "Transaction cancelled due to idempotency check for %s",
-                            message_id,
-                        )
-                        return "duplicate_completion"
-                logger.warning(
-                    "Transaction cancelled for %s (reasons: %s)", message_id, reasons
-                )
-                return "duplicate_completion"
-            logger.warning(
-                "Failed transactional completion for %s: %s", message_id, exc
-            )
-            raise
 
 
 def main() -> None:
@@ -327,19 +274,6 @@ def main() -> None:
     # Clamp max_messages between 1 and 10 (SQS API limit is 10 per receive call)
     max_messages = max(1, min(max_messages, 10))
 
-    # Read minimum sleep time between processing messages (simulates work, default 0.1s)
-    sleep_min = env_float("SLEEP_MIN_SECONDS", 0.1)
-    # Read maximum sleep time between processing messages (default 1.0s)
-    sleep_max = env_float("SLEEP_MAX_SECONDS", 1.0)
-    # Ensure max is at least min (prevent invalid range)
-    if sleep_max < sleep_min:
-        sleep_max = sleep_min
-
-    # Read long sleep duration for simulating slow processing (default 0 = disabled)
-    long_sleep_seconds = env_float("LONG_SLEEP_SECONDS", 0.0)
-    # Read how often to apply long sleep (every Nth message, default 0 = disabled)
-    long_sleep_every = env_int("LONG_SLEEP_EVERY", 0)
-
     # Read crash rate for chaos testing (0.0-1.0 probability, default 0 = no crashes)
     crash_rate = env_float("CRASH_RATE", 0.0)
     # Force crash immediately after receiving a message (deterministic crash for tests)
@@ -352,10 +286,10 @@ def main() -> None:
     idle_timeout_seconds = env_int("IDLE_TIMEOUT_SECONDS", 0)
     # Optional payload marker to reject messages (for poison message testing)
     reject_payload_marker = os.getenv("REJECT_PAYLOAD_MARKER", "")
-    # Use transactional writes for atomic side effect + idempotency (default false)
-    use_transactional_writes = bool(env_int("USE_TRANSACTIONAL_WRITES", 0))
-    # Crash after side effect but before delete (for testing transactional idempotency)
+    # Crash after side effect but before marking complete (for testing idempotency)
     crash_after_side_effect = bool(env_int("CRASH_AFTER_SIDE_EFFECT", 0))
+    # Delay before side effect to simulate slow external service (for visibility timeout testing)
+    side_effect_delay = env_float("SIDE_EFFECT_DELAY_SECONDS", 0.0)
 
     # Log startup configuration so user knows what behavior is enabled
     logger.info(
@@ -371,17 +305,16 @@ def main() -> None:
     # Optional Dynamo tracker for cross-consumer idempotency
     dynamo_tracker: Optional[DynamoTracker] = None
     status_table = os.getenv("MESSAGE_STATUS_TABLE")
-    completed_table = os.getenv("MESSAGE_COMPLETED_TABLE")
-    if status_table and completed_table:
+    side_effects_table = os.getenv("MESSAGE_SIDE_EFFECTS_TABLE")
+    if status_table and side_effects_table:
         dynamo_resource = build_dynamo_resource(region)
-        dynamo_client = build_dynamo_client(region)
         dynamo_tracker = DynamoTracker(
-            dynamo_resource, dynamo_client, status_table, completed_table
+            dynamo_resource, status_table, side_effects_table
         )
         logger.info(
-            "DynamoDB tracking enabled | status_table=%s completed_table=%s",
+            "DynamoDB tracking enabled | status_table=%s side_effects_table=%s",
             status_table,
-            completed_table,
+            side_effects_table,
         )
 
     # Optional in-memory dedupe to simulate idempotency handling.
@@ -457,18 +390,14 @@ def main() -> None:
                         queue_url,
                         message,
                         processed_count,
-                        sleep_min,
-                        sleep_max,
-                        long_sleep_seconds,
-                        long_sleep_every,
                         crash_rate,
                         crash_after_receive,
                         is_duplicate,
                         remember_message_id,
                         dynamo_tracker,
                         reject_payload_marker,
-                        use_transactional_writes,
                         crash_after_side_effect,
+                        side_effect_delay,
                     )
                     # Check if we've hit the optional message limit (for testing)
                     if message_limit and processed_count >= message_limit:
@@ -501,20 +430,26 @@ def handle_message(
     queue_url: str,
     message: Dict[str, Any],
     count: int,
-    sleep_min: float,
-    sleep_max: float,
-    long_sleep_seconds: float,
-    long_sleep_every: int,
     crash_rate: float,
     crash_after_receive: bool,
     is_duplicate: Callable[[str], bool],
     remember_message_id: Callable[[str], None],
     dynamo_tracker: Optional[DynamoTracker],
     reject_payload_marker: str = "",
-    use_transactional_writes: bool = False,
     crash_after_side_effect: bool = False,
+    side_effect_delay: float = 0.0,
 ) -> None:
-    """Process a single message with optional chaos behaviors."""
+    """Process a single message using the check-before-doing pattern.
+
+    The flow for external side effects:
+    1. mark_started() → record STARTED in status table
+    2. Check: does message_id exist in side_effects table?
+       - If YES → side effect already done, skip to step 5
+    3. DO SIDE EFFECT: write to side_effects table (simulates external call)
+    4. [crash possible here — CRASH_AFTER_SIDE_EFFECT tests this]
+    5. Update status to COMPLETED (our bookkeeping)
+    6. Delete from SQS
+    """
     # Extract raw message body from SQS message structure
     body_raw = message.get("Body", "")
     # Try to parse body as JSON (expected format from producer)
@@ -532,6 +467,7 @@ def handle_message(
     # Fall back to SQS-generated MessageId if no custom ID found
     message_id = message_id or message.get("MessageId")
 
+    # Step 1: Record that we're starting to process this message
     tracker_state = None
     if message_id and dynamo_tracker:
         tracker_state = dynamo_tracker.mark_started(message_id, payload)
@@ -546,63 +482,55 @@ def handle_message(
     if reject_payload_marker and reject_payload_marker in body_raw:
         raise ValueError(f"Poison message rejected (marker={reject_payload_marker!r}, id={message_id})")
 
-    # Check if this message has been processed before (idempotency check)
+    # Check if this message has been processed before (in-memory idempotency check)
     if message_id and is_duplicate(message_id):
         logger.warning("Duplicate detected; dropping message id=%s", message_id)
-        # Delete from queue to prevent reprocessing (already handled)
         delete_message(sqs_client, queue_url, message)
-        # Exit early - don't process duplicate
         return
 
     # Check if we should intentionally crash (chaos testing - simulates worker failure)
     if crash_rate > 0 and random.random() < crash_rate:
-        # Raise exception to crash the worker (will be caught in main loop)
         raise CrashError("Intentional crash for testing")
 
-    # Calculate random sleep time to simulate variable processing duration
-    sleep_time = random.uniform(sleep_min, sleep_max)
-    # Check if we should apply a long sleep (simulates slow processing every Nth message)
-    if (
-        long_sleep_seconds > 0
-        and long_sleep_every > 0
-        and count % long_sleep_every == 0
-    ):
-        # Use the longer of random sleep or configured long sleep
-        sleep_time = max(sleep_time, long_sleep_seconds)
-        logger.warning("Simulating long processing time: sleeping %.2fs", sleep_time)
-
-    # Log that we're starting to process this message
-    logger.info("Processing message id=%s payload=%s", message_id, payload)
-    # Sleep to simulate work being done (processing time)
-    time.sleep(sleep_time)
-
-    # Force a deterministic crash after doing the work but before delete (test hook)
+    # Force a deterministic crash after receiving but before side effect (test hook)
     if crash_after_receive:
         raise CrashError("Intentional post-receive crash for testing")
 
-    completion_state = None
+    logger.info("Processing message id=%s payload=%s", message_id, payload)
+
+    # Steps 2-5: The check-before-doing pattern for side effects
+    side_effect_state = None
     if message_id and dynamo_tracker:
-        if use_transactional_writes:
-            completion_state = dynamo_tracker.mark_completed_transactional(
-                message_id, payload
-            )
+        # Step 2: Check if side effect was already performed
+        if dynamo_tracker.check_side_effect_exists(message_id):
+            # Side effect already done (we crashed after step 3 but before step 5)
+            logger.info("Side effect already exists for id=%s, skipping to completion", message_id)
+            side_effect_state = "already_done"
         else:
-            completion_state = dynamo_tracker.mark_completed(message_id, payload)
+            # Optional delay to simulate slow external service (for visibility timeout testing)
+            if side_effect_delay > 0:
+                logger.info("Simulating slow external service: sleeping %.1fs", side_effect_delay)
+                time.sleep(side_effect_delay)
+            # Step 3: Perform the side effect (simulates external service call)
+            side_effect_state = dynamo_tracker.do_side_effect(message_id, payload)
 
-    # Crash after side effect but before delete (for testing transactional idempotency)
-    if crash_after_side_effect:
-        raise CrashError("Intentional crash after side effect for testing")
+        # Step 4: Crash point for testing — side effect done but not marked complete
+        if crash_after_side_effect:
+            raise CrashError("Intentional crash after side effect for testing")
 
-    # Delete message from queue after successful processing (prevents redelivery)
+        # Step 5: Update our bookkeeping to record completion
+        dynamo_tracker.mark_completed(message_id)
+
+    # Step 6: Delete message from queue after successful processing
     delete_message(sqs_client, queue_url, message)
 
-    # If we have a message ID, remember it for duplicate detection
+    # Remember this message ID for fast in-memory duplicate detection
     if message_id:
         remember_message_id(message_id)
 
-    # Log successful completion of message processing
-    if completion_state == "duplicate_completion":
-        logger.info("Done message id=%s (detected duplicate completion)", message_id)
+    # Log successful completion
+    if side_effect_state == "already_done":
+        logger.info("Done message id=%s (side effect was already performed)", message_id)
     else:
         logger.info("Done message id=%s", message_id)
 

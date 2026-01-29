@@ -47,10 +47,10 @@ resource "aws_dynamodb_table" "message_status" {
   }
 }
 
-resource "aws_dynamodb_table" "message_completed" {
+resource "aws_dynamodb_table" "message_side_effects" {
   for_each = local.scenarios
 
-  name         = "${each.value}-message-completed"
+  name         = "${each.value}-message-side-effects"
   billing_mode = "PAY_PER_REQUEST"
   hash_key     = "message_id"
 
@@ -69,6 +69,6 @@ QUEUE_URL=${module.sqs["happy"].queue_url}
 DLQ_ARN=${module.sqs["happy"].dead_letter_queue_arn}
 AWS_REGION=${var.aws_region}
 MESSAGE_STATUS_TABLE=${aws_dynamodb_table.message_status["happy"].name}
-MESSAGE_COMPLETED_TABLE=${aws_dynamodb_table.message_completed["happy"].name}
+MESSAGE_SIDE_EFFECTS_TABLE=${aws_dynamodb_table.message_side_effects["happy"].name}
 EOT
 }
