@@ -102,6 +102,8 @@ Producer (local)  ──▶  SQS Queue  ──▶  Consumer (local)  ──▶  
 | `REJECT_PAYLOAD_MARKER` | *(empty)* | Reject messages whose payload contains this marker (for poison message testing) |
 | `MESSAGE_STATUS_TABLE` | *(optional)* | DynamoDB table name for status tracking |
 | `MESSAGE_COMPLETED_TABLE` | *(optional)* | DynamoDB table name for completion idempotency |
+| `USE_TRANSACTIONAL_WRITES` | `0` | Use DynamoDB transactions for atomic side effect + idempotency writes |
+| `CRASH_AFTER_SIDE_EFFECT` | `0` | Crash after DynamoDB transaction but before SQS delete (for testing) |
 | `LOG_LEVEL` | `INFO` | Logging level (DEBUG, INFO, WARNING, ERROR) |
 
 ## Producer usage
@@ -147,6 +149,7 @@ Each message contains a JSON payload with a UUID `id` and a random `work` value 
 - **Duplicate delivery** (`make scenario-duplicates`): slow processing triggers visibility timeout, causing redelivery; DynamoDB-backed idempotency prevents duplicate side effects.
 - **Poison messages** (`make scenario-poison`): messages with a poison marker are rejected and redrive to the DLQ after max retries.
 - **Partial batch failure** (`make scenario-partial-batch`): consumer receives batches of 10 messages containing both good and poison messages; good messages are processed and deleted individually while poison messages are retried and eventually land in the DLQ.
+- **Transactional side effects** (`make scenario-side-effects`): consumer uses DynamoDB transactions to atomically write the side effect and idempotency record; proves no duplicate side effects occur even when crashing after the transaction but before SQS delete.
 
 **Slow** (5–10 minutes):
 - **Backpressure / auto-scaling** (`make scenario-backpressure`): a continuous producer floods the queue; the runner monitors queue depth and spawns additional consumers until equilibrium.
@@ -155,7 +158,7 @@ Each message contains a JSON payload with a UUID `id` and a random `work` value 
 - **Prereqs**: infrastructure provisioned (`make infra-up`), AWS CLI + Terraform on PATH.
 - **Quick start** (venv is created automatically):
   ```bash
-  make scenarios-fast        # run the 5 fast scenarios
+  make scenarios-fast        # run the 6 fast scenarios
   make scenarios-slow        # run slow scenarios (backpressure)
   make scenarios             # run everything (fast then slow)
   ```
@@ -186,7 +189,7 @@ Run `make help` to see all targets. Key ones:
 | `make venv` | Create/update the project venv |
 | `make validate` | Validate scenario infrastructure is healthy |
 | `make scenario-*` | Run individual scenarios |
-| `make scenarios-fast` | Run the 5 fast scenarios |
+| `make scenarios-fast` | Run the 6 fast scenarios |
 | `make scenarios-slow` | Run slow scenarios (backpressure) |
 | `make scenarios` | Run all scenarios (fast then slow) |
 
@@ -200,6 +203,30 @@ make infra-down
 ## Design Considerations for Queue-Based Systems
 
 This section documents deeper design considerations that emerged from building and testing these scenarios.
+
+### The Two-Table Idempotency Pattern
+
+This codebase uses two DynamoDB tables for idempotency, each with a distinct role:
+
+| Table | Role | Key insight |
+|-------|------|-------------|
+| `message_status` | **The side effect** — tracks processing lifecycle (STARTED → COMPLETED) | Updating this to COMPLETED *is* the durable business outcome we care about |
+| `message_completed` | **The idempotency gate** — written with `attribute_not_exists` condition | If this write fails, we know the message was already processed |
+
+**Why two tables instead of one?**
+
+You could use a single table, but the two-table pattern provides:
+1. **Separation of concerns**: Status tracking (with attempt counts, timestamps) vs. simple "was this done?" check
+2. **Defense in depth**: `mark_started()` checks status first (fast path), transaction catches anything that slips through
+3. **Clear semantics**: The completion table is append-only and authoritative; status table can be updated multiple times
+
+**Transactional mode (`USE_TRANSACTIONAL_WRITES=1`)**
+
+When enabled, the consumer uses `TransactWriteItems` to atomically:
+1. Update `message_status` to COMPLETED (the side effect)
+2. Write to `message_completed` with condition (the idempotency gate)
+
+If we crash after the transaction but before SQS delete, the message gets redelivered. On redelivery, the transaction fails because `message_completed` already exists — and crucially, this also rolls back the status update, so we don't record a duplicate side effect.
 
 ### Side Effects Across Multiple External Systems
 

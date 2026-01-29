@@ -64,6 +64,17 @@ def build_dynamo_resource(region: Optional[str]) -> Any:
     return session.resource("dynamodb")
 
 
+def build_dynamo_client(region: Optional[str]) -> Any:
+    """Create a boto3 DynamoDB client scoped to the given region.
+
+    Note: We use a dedicated client (not resource.meta.client) for
+    transact_write_items because the resource's internal client has
+    different serialization behavior that causes key validation errors.
+    """
+    session = boto3.Session(region_name=region)
+    return session.client("dynamodb")
+
+
 def now_iso() -> str:
     """UTC timestamp for table writes."""
     return datetime.utcnow().replace(tzinfo=timezone.utc).isoformat()
@@ -79,11 +90,58 @@ def payload_digest(payload: Any) -> str:
 
 
 class DynamoTracker:
-    """Dynamo-backed idempotency helper for duplicate deliveries."""
+    """DynamoDB-backed idempotency using a two-table pattern.
 
-    def __init__(self, resource: Any, status_table: str, completed_table: str) -> None:
+    ## Two-Table Idempotency Pattern
+
+    This class uses two DynamoDB tables with distinct roles:
+
+    ### message_status (The Side Effect / Processing State)
+    - Tracks the processing lifecycle: STARTED → COMPLETED or FAILED
+    - Records attempt counts for observability
+    - In transactional mode, updating this to COMPLETED is the "side effect"
+      that we want to happen exactly once
+
+    ### message_completed (The Idempotency Gate)
+    - A simple table with just message_id as the key
+    - Written with `attribute_not_exists(message_id)` condition
+    - If the write fails, we know this message was already processed
+    - This is the authoritative "was this done?" check
+
+    ## Why Two Tables?
+
+    The two-table pattern provides defense in depth:
+    1. `mark_started()` checks if status is already COMPLETED (fast path)
+    2. `mark_completed_transactional()` uses a DynamoDB transaction to
+       atomically update status AND write the completion record
+    3. If we crash after the transaction but before SQS delete, the
+       redelivered message will be caught by either check
+
+    ## Transactional vs Non-Transactional Mode
+
+    - **Non-transactional** (default): Two separate writes. A crash between
+      them could leave inconsistent state (status=COMPLETED but no completion
+      record, or vice versa).
+
+    - **Transactional** (USE_TRANSACTIONAL_WRITES=1): Both writes happen
+      atomically. Either both succeed or neither does. This guarantees the
+      "side effect" (status update) only happens if the idempotency gate
+      also succeeds.
+    """
+
+    def __init__(
+        self, resource: Any, client: Any, status_table: str, completed_table: str
+    ) -> None:
+        self.resource = resource
+        # Use a dedicated client for transact_write_items (not resource.meta.client)
+        # because the resource's internal client has different serialization behavior
+        self.client = client
+        # message_status: tracks processing lifecycle, serves as "side effect" in txn mode
         self.status_table = resource.Table(status_table)
+        self.status_table_name = status_table
+        # message_completed: idempotency gate with conditional writes
         self.completed_table = resource.Table(completed_table)
+        self.completed_table_name = completed_table
 
     @staticmethod
     def _is_conditional_failure(exc: ClientError) -> bool:
@@ -179,6 +237,70 @@ class DynamoTracker:
 
         return "new_completion" if completion_recorded else "duplicate_completion"
 
+    def mark_completed_transactional(self, message_id: str, payload: Any) -> str:
+        """Record completion atomically using DynamoDB transactions.
+
+        This wraps both the side effect (updating message_status to COMPLETED)
+        and the idempotency gate (writing to message_completed) in a single
+        transaction. If the idempotency check fails, the entire transaction
+        rolls back — no partial writes.
+        """
+        timestamp = now_iso()
+        digest = payload_digest(payload)
+
+        transact_items = [
+            # The side effect: update status to COMPLETED
+            {
+                "Update": {
+                    "TableName": self.status_table_name,
+                    "Key": {"message_id": {"S": message_id}},
+                    "UpdateExpression": "SET #s = :completed, last_updated = :now",
+                    "ExpressionAttributeNames": {"#s": "status"},
+                    "ExpressionAttributeValues": {
+                        ":completed": {"S": "COMPLETED"},
+                        ":now": {"S": timestamp},
+                    },
+                    "ConditionExpression": "attribute_exists(message_id)",
+                }
+            },
+            # The idempotency gate: write completion record
+            {
+                "Put": {
+                    "TableName": self.completed_table_name,
+                    "Item": {
+                        "message_id": {"S": message_id},
+                        "processed_at": {"S": timestamp},
+                        "payload_digest": {"S": digest},
+                    },
+                    "ConditionExpression": "attribute_not_exists(message_id)",
+                }
+            },
+        ]
+
+        try:
+            self.client.transact_write_items(TransactItems=transact_items)
+            return "new_completion"
+        except ClientError as exc:
+            error_code = exc.response.get("Error", {}).get("Code", "")
+            if error_code == "TransactionCanceledException":
+                # Check cancellation reasons to determine if it was the idempotency check
+                reasons = exc.response.get("CancellationReasons", [])
+                for reason in reasons:
+                    if reason.get("Code") == "ConditionalCheckFailed":
+                        logger.info(
+                            "Transaction cancelled due to idempotency check for %s",
+                            message_id,
+                        )
+                        return "duplicate_completion"
+                logger.warning(
+                    "Transaction cancelled for %s (reasons: %s)", message_id, reasons
+                )
+                return "duplicate_completion"
+            logger.warning(
+                "Failed transactional completion for %s: %s", message_id, exc
+            )
+            raise
+
 
 def main() -> None:
     """Entry point: poll SQS with configurable behavior for demo/failure modes."""
@@ -230,6 +352,10 @@ def main() -> None:
     idle_timeout_seconds = env_int("IDLE_TIMEOUT_SECONDS", 0)
     # Optional payload marker to reject messages (for poison message testing)
     reject_payload_marker = os.getenv("REJECT_PAYLOAD_MARKER", "")
+    # Use transactional writes for atomic side effect + idempotency (default false)
+    use_transactional_writes = bool(env_int("USE_TRANSACTIONAL_WRITES", 0))
+    # Crash after side effect but before delete (for testing transactional idempotency)
+    crash_after_side_effect = bool(env_int("CRASH_AFTER_SIDE_EFFECT", 0))
 
     # Log startup configuration so user knows what behavior is enabled
     logger.info(
@@ -248,7 +374,10 @@ def main() -> None:
     completed_table = os.getenv("MESSAGE_COMPLETED_TABLE")
     if status_table and completed_table:
         dynamo_resource = build_dynamo_resource(region)
-        dynamo_tracker = DynamoTracker(dynamo_resource, status_table, completed_table)
+        dynamo_client = build_dynamo_client(region)
+        dynamo_tracker = DynamoTracker(
+            dynamo_resource, dynamo_client, status_table, completed_table
+        )
         logger.info(
             "DynamoDB tracking enabled | status_table=%s completed_table=%s",
             status_table,
@@ -338,6 +467,8 @@ def main() -> None:
                         remember_message_id,
                         dynamo_tracker,
                         reject_payload_marker,
+                        use_transactional_writes,
+                        crash_after_side_effect,
                     )
                     # Check if we've hit the optional message limit (for testing)
                     if message_limit and processed_count >= message_limit:
@@ -380,6 +511,8 @@ def handle_message(
     remember_message_id: Callable[[str], None],
     dynamo_tracker: Optional[DynamoTracker],
     reject_payload_marker: str = "",
+    use_transactional_writes: bool = False,
+    crash_after_side_effect: bool = False,
 ) -> None:
     """Process a single message with optional chaos behaviors."""
     # Extract raw message body from SQS message structure
@@ -449,7 +582,16 @@ def handle_message(
 
     completion_state = None
     if message_id and dynamo_tracker:
-        completion_state = dynamo_tracker.mark_completed(message_id, payload)
+        if use_transactional_writes:
+            completion_state = dynamo_tracker.mark_completed_transactional(
+                message_id, payload
+            )
+        else:
+            completion_state = dynamo_tracker.mark_completed(message_id, payload)
+
+    # Crash after side effect but before delete (for testing transactional idempotency)
+    if crash_after_side_effect:
+        raise CrashError("Intentional crash after side effect for testing")
 
     # Delete message from queue after successful processing (prevents redelivery)
     delete_message(sqs_client, queue_url, message)

@@ -30,6 +30,7 @@ SCENARIO_TF_KEYS = {
     "duplicates": "dup",
     "poison": "poison",
     "partial-batch": "poison",  # reuses poison scenario infrastructure
+    "side-effects": "dup",  # reuses dup infrastructure (has DynamoDB + short visibility)
     "backpressure": "backpressure",
 }
 
@@ -676,6 +677,136 @@ def scenario_partial_batch(args: argparse.Namespace, outputs: Dict) -> None:
     )
 
 
+def scenario_side_effects(args: argparse.Namespace, outputs: Dict) -> None:
+    """Scenario 6: Transactional side effects — prove that atomic DynamoDB
+    transactions prevent duplicate side effects even when crashes occur.
+
+    The consumer uses TransactWriteItems to atomically:
+    1. Update message_status to COMPLETED (the side effect)
+    2. Write to message_completed with condition (the idempotency gate)
+
+    If we crash after the transaction but before SQS delete, the message gets
+    redelivered. On redelivery, the idempotency check fails and the entire
+    transaction rolls back — no duplicate side effect.
+    """
+    queue_url = outputs["queue_url"]
+    region = outputs["aws_region"]
+    profile = os.environ.get("AWS_PROFILE", "")
+    dlq_url = queue_url_from_arn(outputs["dlq_arn"])
+    status_table_name = outputs["message_status_table"]
+    completed_table_name = outputs["message_completed_table"]
+    sqs = build_sqs_client(region, profile)
+    dynamo = build_dynamo_resource(region, profile)
+    cleanup_scenario_state(sqs, dynamo, outputs, "side-effects")
+
+    message_count = args.count
+
+    print(f"[side-effects] Sending {message_count} messages ...")
+    run_producer(
+        message_count,
+        batch_size=min(10, message_count),
+        region=region,
+        queue_url=queue_url,
+        profile=profile,
+    )
+    print("[side-effects] Confirming messages are enqueued ...")
+    wait_for_messages_enqueued(sqs, queue_url, message_count)
+
+    # Phase 1: Run consumer with transactional writes + crash after side effect
+    # This processes messages, writes to DynamoDB, then crashes before delete
+    print("[side-effects] Running consumer with USE_TRANSACTIONAL_WRITES=1, CRASH_AFTER_SIDE_EFFECT=1 ...")
+    consumer_env = {
+        "QUEUE_URL": queue_url,
+        "AWS_REGION": region,
+        "MESSAGE_STATUS_TABLE": status_table_name,
+        "MESSAGE_COMPLETED_TABLE": completed_table_name,
+        "USE_TRANSACTIONAL_WRITES": "1",
+        "CRASH_AFTER_SIDE_EFFECT": "1",
+        "IDLE_TIMEOUT_SECONDS": "10",
+        "LOG_LEVEL": "INFO",
+        "MAX_MESSAGES": "1",
+        "WAIT_TIME_SECONDS": "5",
+    }
+
+    # Consumer will crash after each message, so we expect a non-zero exit
+    proc = run_local_consumer_async(consumer_env)
+    # Give it time to process messages and crash
+    time.sleep(args.crash_window)
+    if proc.poll() is None:
+        proc.terminate()
+        proc.wait(timeout=10)
+
+    # Phase 2: Wait for visibility timeout so messages become visible again
+    print(f"[side-effects] Waiting {args.visibility_wait}s for visibility timeout ...")
+    time.sleep(args.visibility_wait)
+
+    # Phase 3: Run consumer normally (still transactional) to handle redeliveries
+    # The transaction should fail on redelivery due to idempotency check
+    print("[side-effects] Running consumer to handle redeliveries ...")
+    consumer_env_normal = {
+        "QUEUE_URL": queue_url,
+        "AWS_REGION": region,
+        "MESSAGE_STATUS_TABLE": status_table_name,
+        "MESSAGE_COMPLETED_TABLE": completed_table_name,
+        "USE_TRANSACTIONAL_WRITES": "1",
+        "IDLE_TIMEOUT_SECONDS": str(args.idle_timeout),
+        "LOG_LEVEL": "INFO",
+        "MAX_MESSAGES": "1",
+        "WAIT_TIME_SECONDS": "5",
+    }
+
+    exit_code = run_local_consumer(env=consumer_env_normal, timeout=args.consumer_timeout)
+    if exit_code != 0:
+        raise RuntimeError(f"Second consumer run failed with exit code {exit_code}")
+
+    print("[side-effects] Waiting for queue to drain ...")
+    wait_for_queue_empty(sqs, queue_url, timeout=args.queue_timeout)
+
+    # Phase 4: Assertions
+    # Check that message_completed has exactly message_count entries (no duplicates)
+    completed_table = dynamo.Table(completed_table_name)
+    completed_count = 0
+    scan_kw: Dict = {"Select": "COUNT"}
+    while True:
+        resp = completed_table.scan(**scan_kw)
+        completed_count += resp["Count"]
+        if "LastEvaluatedKey" not in resp:
+            break
+        scan_kw["ExclusiveStartKey"] = resp["LastEvaluatedKey"]
+
+    if completed_count != message_count:
+        raise RuntimeError(
+            f"Expected {message_count} completion records, found {completed_count}. "
+            "Duplicate side effects may have occurred!"
+        )
+
+    # Check that message_status has message_count COMPLETED entries
+    status_table = dynamo.Table(status_table_name)
+    status_count = 0
+    scan_kw = {"Select": "COUNT", "FilterExpression": "#s = :completed"}
+    scan_kw["ExpressionAttributeNames"] = {"#s": "status"}
+    scan_kw["ExpressionAttributeValues"] = {":completed": "COMPLETED"}
+    while True:
+        resp = status_table.scan(**scan_kw)
+        status_count += resp["Count"]
+        if "LastEvaluatedKey" not in resp:
+            break
+        scan_kw["ExclusiveStartKey"] = resp["LastEvaluatedKey"]
+
+    if status_count != message_count:
+        raise RuntimeError(
+            f"Expected {message_count} COMPLETED statuses, found {status_count}"
+        )
+
+    # DLQ should be empty (no failures, just idempotent skips)
+    ensure_queue_empty(sqs, dlq_url, "DLQ")
+
+    print(
+        f"[side-effects] PASS | {message_count} messages processed, "
+        f"{completed_count} unique completions (no duplicates)"
+    )
+
+
 def scenario_backpressure(args: argparse.Namespace, outputs: Dict) -> None:
     """Scenario 5: Backpressure — auto-scale consumers when a continuous
     producer overwhelms them, then confirm equilibrium and drain.
@@ -971,6 +1102,41 @@ def parse_args() -> argparse.Namespace:
         help="Timeout (seconds) to wait for queue to drain",
     )
 
+    side = subparsers.add_parser(
+        "side-effects", help="Transactional side effects scenario (atomic writes prevent duplicates)"
+    )
+    side.add_argument("--count", type=int, default=5, help="Messages to send")
+    side.add_argument(
+        "--crash-window",
+        type=int,
+        default=15,
+        help="Seconds to let consumer run before killing (should process all messages)",
+    )
+    side.add_argument(
+        "--visibility-wait",
+        type=int,
+        default=DEFAULT_VISIBILITY_BUFFER,
+        help="Seconds to wait for visibility timeout to expire after crash",
+    )
+    side.add_argument(
+        "--idle-timeout",
+        type=int,
+        default=30,
+        help="Idle timeout for second consumer run",
+    )
+    side.add_argument(
+        "--consumer-timeout",
+        type=int,
+        default=120,
+        help="Timeout (seconds) for consumer subprocess",
+    )
+    side.add_argument(
+        "--queue-timeout",
+        type=int,
+        default=120,
+        help="Timeout (seconds) to wait for queue to drain",
+    )
+
     bp = subparsers.add_parser("backpressure", help="Backpressure / auto-scaling scenario")
     bp.add_argument("--rate", type=int, default=5, help="Producer messages per second")
     bp.add_argument("--batch-size", type=int, default=10, help="Producer batch size (<=10)")
@@ -1008,6 +1174,7 @@ def main() -> None:
         "duplicates": scenario_duplicates,
         "poison": scenario_poison,
         "partial-batch": scenario_partial_batch,
+        "side-effects": scenario_side_effects,
         "backpressure": scenario_backpressure,
     }.get(args.scenario)
 
