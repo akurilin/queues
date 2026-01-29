@@ -262,6 +262,40 @@ def wait_for_queue_empty(
     raise RuntimeError("Queue did not drain within timeout")
 
 
+def wait_for_queue_depth(
+    sqs: BaseClient,
+    queue_url: str,
+    expected: int,
+    timeout: int = 30,
+    poll_seconds: int = 2,
+    confirmations: int = 2,
+) -> Dict[str, int]:
+    """Wait until queue depth reaches expected count or timeout.
+
+    SQS approximate counts are eventually consistent, so we require
+    *confirmations* consecutive matching readings before returning.
+
+    Returns the final depth reading.
+    """
+    deadline = time.time() + timeout
+    matches_seen = 0
+    last_depth: Dict[str, int] = {"visible": -1, "not_visible": -1}
+    while time.time() < deadline:
+        last_depth = get_queue_depth(sqs, queue_url)
+        total = last_depth["visible"] + last_depth["not_visible"]
+        if total == expected:
+            matches_seen += 1
+            if matches_seen >= confirmations:
+                return last_depth
+        else:
+            matches_seen = 0
+        time.sleep(poll_seconds)
+    raise RuntimeError(
+        f"Queue depth did not reach {expected} within {timeout}s "
+        f"(last seen: visible={last_depth['visible']}, not_visible={last_depth['not_visible']})"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Local consumer helpers
 # ---------------------------------------------------------------------------
@@ -1198,9 +1232,6 @@ def scenario_graceful_shutdown(args: argparse.Namespace, outputs: Dict) -> None:
             f"(finished in-flight work before exiting)"
         )
 
-    # Give SQS a moment to update message visibility
-    time.sleep(2)
-
     # Assert: exactly 1 side effect record (consumer finished processing 1 message)
     side_effects_table = dynamo.Table(side_effects_table_name)
     side_effects_count = 0
@@ -1229,14 +1260,16 @@ def scenario_graceful_shutdown(args: argparse.Namespace, outputs: Dict) -> None:
         # (We can't easily compare ISO timestamps to Unix time, but the timing check above covers this)
 
     # Assert: remaining messages still in queue (message_count - 1)
+    # Use polling with confirmations because SQS ApproximateNumberOfMessages
+    # is eventually consistent and may not reflect the delete immediately
     expected_remaining = message_count - 1
-    depth = get_queue_depth(sqs, queue_url)
-    actual_remaining = depth["visible"] + depth["not_visible"]
-    if actual_remaining != expected_remaining:
+    print(f"[graceful-shutdown] Waiting for queue depth to reach {expected_remaining} ...")
+    try:
+        depth = wait_for_queue_depth(sqs, queue_url, expected_remaining, timeout=30)
+    except RuntimeError as exc:
         raise RuntimeError(
-            f"Expected {expected_remaining} messages remaining in queue, "
-            f"found {actual_remaining} (visible={depth['visible']}, not_visible={depth['not_visible']})"
-        )
+            f"Expected {expected_remaining} messages remaining in queue: {exc}"
+        ) from exc
 
     # Assert: DLQ is empty (no failures)
     ensure_queue_empty(sqs, dlq_url, "DLQ")
