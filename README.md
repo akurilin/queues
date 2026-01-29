@@ -194,3 +194,58 @@ Run `make help` to see all targets. Key ones:
 ```bash
 make infra-down
 ```
+
+---
+
+## Design Considerations for Queue-Based Systems
+
+This section documents deeper design considerations that emerged from building and testing these scenarios.
+
+### Side Effects Across Multiple External Systems
+
+When your consumer needs to write to multiple systems (e.g., charge via Stripe, send an email, update a database), you can't wrap everything in a single transaction. A DynamoDB transaction can't include an HTTP call to Stripe.
+
+**Common patterns:**
+
+| Pattern | How it works | Trade-offs |
+|---------|--------------|------------|
+| **Outbox** | Write business data + outbox record in one DB transaction. A separate process reads the outbox and calls external systems, marking entries as processed. | Adds complexity (outbox reader), but guarantees the intent is durably recorded before external calls. |
+| **Saga** | Break the operation into steps with compensating actions. If step 3 fails, run compensation for steps 1–2 (e.g., refund the charge). | Works for multi-system workflows, but compensation logic can be complex and some actions aren't reversible. |
+| **Idempotency keys to external systems** | Pass a stable key (e.g., `Idempotency-Key` header to Stripe). On retry, the external system returns the cached result instead of re-executing. | Relies on external systems supporting idempotency. Most payment APIs do; arbitrary HTTP endpoints may not. |
+
+The outbox pattern is particularly common: you never call an external system unless the intent is already durably recorded, and you never lose track of what succeeded or failed.
+
+### Delivery Idempotency vs. Business Idempotency
+
+There are two distinct duplication problems:
+
+| Type | Cause | Solution |
+|------|-------|----------|
+| **Delivery idempotency** | SQS redelivers the same message (visibility timeout, crash before delete) | Dedupe on `message_id` — the ID the producer assigned to the message |
+| **Business idempotency** | Producer sends the same logical work twice with different message IDs (user double-clicks, retry logic, bugs) | Dedupe on a business key like `order_id` or `payment_intent_id` |
+
+This demo implements delivery idempotency: the `message_completed` table is keyed on `message_id`, which the producer generates as a UUID. If the same message is redelivered, the conditional write fails and we skip reprocessing.
+
+But if the producer sends two messages with different UUIDs that both say "charge order-123", the consumer will process both — because they have different `message_id` values. To catch this, you need the producer to include a business-level idempotency key in the payload:
+
+```json
+{
+  "id": "uuid-1",
+  "order_id": "order-123",
+  "action": "charge"
+}
+```
+
+Then the consumer dedupes on `order_id + action`, not just `message_id`.
+
+### How Real-World Systems Handle This
+
+- **Stripe** requires callers to provide an `Idempotency-Key` header. If you don't, duplicate charges are your responsibility.
+
+- **Payment systems** typically use `payment_intent_id` or `order_id` as the idempotency key, not the message/event ID. The message is just a delivery mechanism.
+
+- **Event-driven architectures** often treat events as "facts that happened" and push idempotency responsibility to consumers. If you receive `OrderCreated` twice with different event IDs but the same `order_id`, you're expected to dedupe.
+
+- **API gateways** sometimes generate client-side idempotency keys and reject duplicates at the edge before they hit the queue.
+
+The key insight: **message-level idempotency protects against infrastructure problems (redelivery), but business-level idempotency protects against application problems (duplicate requests).** Most production systems need both.
