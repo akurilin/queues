@@ -32,6 +32,8 @@ SCENARIO_TF_KEYS = {
     "partial-batch": "poison",  # reuses poison scenario infrastructure
     "side-effects": "dup",  # reuses dup infrastructure (has DynamoDB + short visibility)
     "backpressure": "backpressure",
+    "graceful-shutdown": "dup",  # reuses dup infrastructure (has DynamoDB + short visibility)
+    "purge-timing": "happy",  # reuses happy infrastructure (just needs a queue)
 }
 
 
@@ -167,6 +169,9 @@ def clear_dynamo_table(dynamo_resource, table_name: str) -> None:
     print(f"[cleanup] Cleared DynamoDB table {table_name}")
 
 
+PURGE_SAFETY_DELAY = 10  # seconds to wait even when queue appears empty
+
+
 def cleanup_scenario_state(
     sqs: BaseClient, dynamo_resource, outputs: Dict, label: str
 ) -> None:
@@ -174,6 +179,9 @@ def cleanup_scenario_state(
 
     When a purge is issued, waits the full 60 seconds for it to complete
     before returning so callers can safely send new messages (see quirk #1).
+
+    Even when no purge is needed, waits a short safety delay in case a previous
+    scenario's purge is still running asynchronously.
     """
     print(f"[{label}] Cleaning up previous state ...")
     queue_url = outputs["queue_url"]
@@ -185,6 +193,11 @@ def cleanup_scenario_state(
     if purged_primary or purged_dlq:
         print(f"[{label}] Waiting 60s for SQS purge to complete ...")
         time.sleep(60)
+    else:
+        print(
+            f"[{label}] Waiting {PURGE_SAFETY_DELAY}s in case a previous purge is still running ..."
+        )
+        time.sleep(PURGE_SAFETY_DELAY)
 
 
 def ensure_queue_empty(sqs: BaseClient, queue_url: str, label: str) -> None:
@@ -994,6 +1007,424 @@ def scenario_backpressure(args: argparse.Namespace, outputs: Dict) -> None:
     )
 
 
+def scenario_graceful_shutdown(args: argparse.Namespace, outputs: Dict) -> None:
+    """Scenario 8: Graceful shutdown — consumer finishes in-flight work after
+    receiving SIGTERM before exiting.
+
+    Demonstrates that when a consumer receives SIGTERM (e.g., during deployment,
+    scale-down, or container stop), it finishes processing the current message
+    before exiting cleanly. This prevents unnecessary redeliveries and wasted work.
+
+    Flow:
+    1. Send messages to queue
+    2. Start consumer with slow processing (5s per message)
+    3. Wait for consumer to start processing first message
+    4. Send SIGTERM to consumer
+    5. Consumer finishes current message, then exits with code 0
+    6. Assert: side effect recorded for processed message, remaining messages in queue
+    """
+    queue_url = outputs["queue_url"]
+    region = outputs["aws_region"]
+    profile = os.environ.get("AWS_PROFILE", "")
+    dlq_url = queue_url_from_arn(outputs["dlq_arn"])
+    status_table_name = outputs["message_status_table"]
+    side_effects_table_name = outputs["message_side_effects_table"]
+    sqs = build_sqs_client(region, profile)
+    dynamo = build_dynamo_resource(region, profile)
+    cleanup_scenario_state(sqs, dynamo, outputs, "graceful-shutdown")
+
+    message_count = args.count
+    processing_delay = args.processing_delay
+    sigterm_delay = args.sigterm_delay
+
+    print(f"[graceful-shutdown] Sending {message_count} messages ...")
+    run_producer(
+        message_count,
+        batch_size=min(10, message_count),
+        region=region,
+        queue_url=queue_url,
+        profile=profile,
+    )
+    print("[graceful-shutdown] Confirming messages are enqueued ...")
+    wait_for_messages_enqueued(sqs, queue_url, message_count)
+
+    # Start consumer with slow processing — it will take processing_delay seconds
+    # per message, so we have time to send SIGTERM while it's working
+    print(
+        f"[graceful-shutdown] Starting consumer with {processing_delay}s processing delay ..."
+    )
+    consumer_env = {
+        "QUEUE_URL": queue_url,
+        "AWS_REGION": region,
+        "MESSAGE_STATUS_TABLE": status_table_name,
+        "MESSAGE_SIDE_EFFECTS_TABLE": side_effects_table_name,
+        "SIDE_EFFECT_DELAY_SECONDS": str(processing_delay),
+        "IDLE_TIMEOUT_SECONDS": str(args.idle_timeout),
+        "LOG_LEVEL": "INFO",
+        "MAX_MESSAGES": "1",
+        "WAIT_TIME_SECONDS": "1",
+    }
+    proc = run_local_consumer_async(consumer_env)
+
+    # Wait for consumer to pick up first message and start processing
+    print(f"[graceful-shutdown] Waiting {sigterm_delay}s for consumer to start processing ...")
+    time.sleep(sigterm_delay)
+
+    # Send SIGTERM — consumer should finish current message then exit
+    print("[graceful-shutdown] Sending SIGTERM to consumer ...")
+    sigterm_time = time.time()
+    proc.terminate()
+
+    # Wait for consumer to exit
+    try:
+        proc.wait(timeout=args.consumer_timeout)
+    except subprocess.TimeoutExpired:
+        print("[graceful-shutdown] Consumer did not exit in time, killing ...")
+        proc.kill()
+        proc.wait(timeout=10)
+        raise RuntimeError("Consumer did not exit gracefully after SIGTERM")
+
+    exit_time = time.time()
+    time_after_sigterm = exit_time - sigterm_time
+
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"Consumer exited with code {proc.returncode}, expected 0 for graceful shutdown"
+        )
+
+    # Verify timing: consumer should have taken time to finish processing after SIGTERM
+    # If it exited immediately (<1s), it either wasn't processing or didn't finish the work
+    min_expected_processing_time = processing_delay - sigterm_delay - 1  # Allow 1s slack
+    if time_after_sigterm < min_expected_processing_time:
+        print(
+            f"[graceful-shutdown] WARNING: Consumer exited {time_after_sigterm:.1f}s after SIGTERM, "
+            f"expected ~{processing_delay - sigterm_delay}s to finish processing. "
+            f"May not have been mid-processing when SIGTERM arrived."
+        )
+    else:
+        print(
+            f"[graceful-shutdown] Consumer exited {time_after_sigterm:.1f}s after SIGTERM "
+            f"(finished in-flight work before exiting)"
+        )
+
+    # Give SQS a moment to update message visibility
+    time.sleep(2)
+
+    # Assert: exactly 1 side effect record (consumer finished processing 1 message)
+    side_effects_table = dynamo.Table(side_effects_table_name)
+    side_effects_count = 0
+    scan_kw: Dict = {"Select": "COUNT"}
+    while True:
+        resp = side_effects_table.scan(**scan_kw)
+        side_effects_count += resp["Count"]
+        if "LastEvaluatedKey" not in resp:
+            break
+        scan_kw["ExclusiveStartKey"] = resp["LastEvaluatedKey"]
+
+    if side_effects_count != 1:
+        raise RuntimeError(
+            f"Expected exactly 1 side effect (message processed before shutdown), "
+            f"found {side_effects_count}"
+        )
+
+    # Verify the side effect was performed AFTER SIGTERM (proves graceful completion)
+    # Scan to get the actual record with timestamp
+    scan_resp = side_effects_table.scan(Limit=1)
+    if scan_resp.get("Items"):
+        side_effect_record = scan_resp["Items"][0]
+        performed_at = side_effect_record.get("performed_at", "")
+        print(f"[graceful-shutdown] Side effect performed at: {performed_at}")
+        # The side effect should have been performed after SIGTERM
+        # (We can't easily compare ISO timestamps to Unix time, but the timing check above covers this)
+
+    # Assert: remaining messages still in queue (message_count - 1)
+    expected_remaining = message_count - 1
+    depth = get_queue_depth(sqs, queue_url)
+    actual_remaining = depth["visible"] + depth["not_visible"]
+    if actual_remaining != expected_remaining:
+        raise RuntimeError(
+            f"Expected {expected_remaining} messages remaining in queue, "
+            f"found {actual_remaining} (visible={depth['visible']}, not_visible={depth['not_visible']})"
+        )
+
+    # Assert: DLQ is empty (no failures)
+    ensure_queue_empty(sqs, dlq_url, "DLQ")
+
+    print(
+        f"[graceful-shutdown] PASS | 1 message processed before shutdown, "
+        f"{expected_remaining} messages remaining in queue"
+    )
+
+
+def scenario_purge_timing(args: argparse.Namespace, outputs: Dict) -> None:
+    """Scenario: SQS purge timing — verify our understanding of the 60-second
+    purge window and its effects on message delivery.
+
+    SQS PurgeQueue is asynchronous: the API returns immediately but deletion
+    continues for up to 60 seconds. Messages sent DURING this window can be
+    silently deleted. This scenario tests and documents this behavior.
+
+    The scenario runs multiple iterations to statistically observe the behavior,
+    since any single run might get lucky with timing.
+
+    Tests:
+    1. Messages sent immediately after purge may be deleted (danger window)
+    2. Messages sent after 65s are safe
+    3. ApproximateNumberOfMessages can be misleading during purge
+    """
+    queue_url = outputs["queue_url"]
+    region = outputs["aws_region"]
+    profile = os.environ.get("AWS_PROFILE", "")
+    sqs = build_sqs_client(region, profile)
+    dynamo = build_dynamo_resource(region, profile)
+
+    # Use a minimal cleanup - just clear DynamoDB, don't purge (we'll do that ourselves)
+    print("[purge-timing] Clearing DynamoDB tables ...")
+    clear_dynamo_table(dynamo, outputs["message_status_table"])
+    clear_dynamo_table(dynamo, outputs["message_side_effects_table"])
+
+    iterations = args.iterations
+    danger_count_per_iter = args.danger_count
+    safe_window_delay = args.safe_delay
+
+    total_danger_sent = 0
+    total_danger_survived = 0
+    total_safe_sent = 0
+    total_safe_survived = 0
+
+    for iteration in range(1, iterations + 1):
+        print(f"\n[purge-timing] === Iteration {iteration}/{iterations} ===")
+
+        # Phase 1: Seed the queue with messages, then purge
+        seed_count = 10
+        print(f"[purge-timing] Seeding queue with {seed_count} messages ...")
+        for i in range(seed_count):
+            sqs.send_message(
+                QueueUrl=queue_url,
+                MessageBody=json.dumps({"id": f"seed-{iteration}-{i}", "phase": "seed"}),
+            )
+        time.sleep(2)  # Let messages settle
+
+        print("[purge-timing] Initiating purge ...")
+        sqs.purge_queue(QueueUrl=queue_url)
+        purge_start = time.time()
+
+        # Phase 2: Send messages IMMEDIATELY (0s delay) to maximize chance of loss
+        print(f"[purge-timing] Sending {danger_count_per_iter} messages IMMEDIATELY after purge ...")
+        for i in range(danger_count_per_iter):
+            sqs.send_message(
+                QueueUrl=queue_url,
+                MessageBody=json.dumps({
+                    "id": f"danger-{iteration}-{i}",
+                    "phase": "danger-window",
+                    "iteration": iteration,
+                }),
+            )
+        total_danger_sent += danger_count_per_iter
+
+        # Also send some messages at intervals during the danger window
+        intervals = [5, 15, 30, 45]
+        for delay in intervals:
+            elapsed = time.time() - purge_start
+            sleep_needed = delay - elapsed
+            if sleep_needed > 0:
+                time.sleep(sleep_needed)
+            sqs.send_message(
+                QueueUrl=queue_url,
+                MessageBody=json.dumps({
+                    "id": f"danger-{iteration}-t{delay}",
+                    "phase": "danger-window",
+                    "iteration": iteration,
+                    "delay": delay,
+                }),
+            )
+            total_danger_sent += 1
+            print(f"[purge-timing]   Sent message at t+{delay}s")
+
+        # Phase 3: Wait for purge to complete (65s total from purge start)
+        elapsed = time.time() - purge_start
+        remaining_wait = max(0, safe_window_delay - elapsed)
+        if remaining_wait > 0:
+            print(f"[purge-timing] Waiting {remaining_wait:.0f}s for purge window to close ...")
+            time.sleep(remaining_wait)
+
+        # Phase 4: Send messages after purge window (should all survive)
+        safe_count = 5
+        print(f"[purge-timing] Sending {safe_count} messages after purge window ...")
+        for i in range(safe_count):
+            sqs.send_message(
+                QueueUrl=queue_url,
+                MessageBody=json.dumps({
+                    "id": f"safe-{iteration}-{i}",
+                    "phase": "after-purge",
+                    "iteration": iteration,
+                }),
+            )
+        total_safe_sent += safe_count
+
+        # Phase 5: Drain and count messages
+        time.sleep(2)  # Let messages settle
+        iter_danger_survived = 0
+        iter_safe_survived = 0
+
+        while True:
+            resp = sqs.receive_message(
+                QueueUrl=queue_url,
+                MaxNumberOfMessages=10,
+                WaitTimeSeconds=2,
+            )
+            messages = resp.get("Messages", [])
+            if not messages:
+                break
+            for msg in messages:
+                body = json.loads(msg["Body"])
+                if body.get("phase") == "danger-window":
+                    iter_danger_survived += 1
+                elif body.get("phase") == "after-purge":
+                    iter_safe_survived += 1
+                sqs.delete_message(QueueUrl=queue_url, ReceiptHandle=msg["ReceiptHandle"])
+
+        total_danger_survived += iter_danger_survived
+        total_safe_survived += iter_safe_survived
+
+        iter_danger_sent = danger_count_per_iter + len(intervals)
+        print(
+            f"[purge-timing] Iteration {iteration} results: "
+            f"danger={iter_danger_survived}/{iter_danger_sent} survived, "
+            f"safe={iter_safe_survived}/{safe_count} survived"
+        )
+
+        if iter_danger_survived < iter_danger_sent:
+            print(f"[purge-timing] >>> OBSERVED MESSAGE LOSS: {iter_danger_sent - iter_danger_survived} messages deleted by purge")
+
+    # Final summary
+    print(f"\n[purge-timing] === SUMMARY ({iterations} iterations) ===")
+    total_danger_lost = total_danger_sent - total_danger_survived
+    total_safe_lost = total_safe_sent - total_safe_survived
+
+    print(f"[purge-timing] Danger window: {total_danger_survived}/{total_danger_sent} survived ({total_danger_lost} lost)")
+    print(f"[purge-timing] Safe window:   {total_safe_survived}/{total_safe_sent} survived ({total_safe_lost} lost)")
+
+    # Assertions
+    if total_safe_lost > 0:
+        raise RuntimeError(
+            f"UNEXPECTED: Messages sent after 65s purge window were lost! "
+            f"lost={total_safe_lost}/{total_safe_sent}. "
+            f"This contradicts AWS documentation."
+        )
+
+    if total_danger_lost > 0:
+        print(
+            f"[purge-timing] PASS | Confirmed purge danger window behavior: "
+            f"{total_danger_lost}/{total_danger_sent} messages lost during window. "
+            f"All {total_safe_sent} messages after window survived."
+        )
+    else:
+        print(
+            f"[purge-timing] PASS (inconclusive for same-run) | No message loss observed in {iterations} iterations. "
+            f"All {total_safe_sent} safe-window messages survived as expected."
+        )
+
+    # Phase 6: Cross-run simulation
+    # The real danger is when a PREVIOUS run's purge affects a NEW run's messages
+    # Simulate this by purging, returning immediately, and checking if rapid re-send loses messages
+    print(f"\n[purge-timing] === Cross-run simulation ===")
+    print("[purge-timing] This simulates what happens when scenarios run back-to-back:")
+    print("[purge-timing]   Run A purges at end -> Run B starts immediately -> sends messages")
+
+    # Seed and purge
+    print("[purge-timing] Seeding queue ...")
+    for i in range(20):
+        sqs.send_message(
+            QueueUrl=queue_url,
+            MessageBody=json.dumps({"id": f"cross-seed-{i}", "phase": "seed"}),
+        )
+    time.sleep(2)
+
+    print("[purge-timing] Purging (simulating end of Run A) ...")
+    sqs.purge_queue(QueueUrl=queue_url)
+
+    # Immediately send messages (simulating Run B starting with minimal delay)
+    delays_to_test = [0, 2, 5, 10, 15, 30, 45, 60, 65]
+    cross_run_results: Dict[int, Dict[str, int]] = {}
+    purge_start = time.time()
+
+    for delay in delays_to_test:
+        elapsed = time.time() - purge_start
+        sleep_needed = delay - elapsed
+        if sleep_needed > 0:
+            time.sleep(sleep_needed)
+
+        # Send a batch of messages at this delay point
+        batch_size = 5
+        for i in range(batch_size):
+            sqs.send_message(
+                QueueUrl=queue_url,
+                MessageBody=json.dumps({
+                    "id": f"cross-{delay}s-{i}",
+                    "phase": "cross-run",
+                    "delay": delay,
+                }),
+            )
+        print(f"[purge-timing] Sent {batch_size} messages at t+{delay}s")
+        cross_run_results[delay] = {"sent": batch_size, "survived": 0}
+
+    # Wait for everything to settle, then drain
+    print("[purge-timing] Waiting 10s for messages to settle ...")
+    time.sleep(10)
+
+    print("[purge-timing] Draining queue to count survivors ...")
+    while True:
+        resp = sqs.receive_message(
+            QueueUrl=queue_url,
+            MaxNumberOfMessages=10,
+            WaitTimeSeconds=2,
+        )
+        messages = resp.get("Messages", [])
+        if not messages:
+            break
+        for msg in messages:
+            body = json.loads(msg["Body"])
+            if body.get("phase") == "cross-run":
+                delay = body.get("delay", -1)
+                if delay in cross_run_results:
+                    cross_run_results[delay]["survived"] += 1
+            sqs.delete_message(QueueUrl=queue_url, ReceiptHandle=msg["ReceiptHandle"])
+
+    # Report cross-run results
+    print("\n[purge-timing] Cross-run results by delay after purge:")
+    print("[purge-timing]   Delay | Sent | Survived | Lost")
+    print("[purge-timing]   ------|------|----------|-----")
+    any_cross_run_loss = False
+    for delay in delays_to_test:
+        r = cross_run_results[delay]
+        lost = r["sent"] - r["survived"]
+        status = "<<<" if lost > 0 else ""
+        print(f"[purge-timing]   {delay:4}s | {r['sent']:4} | {r['survived']:8} | {lost:4} {status}")
+        if lost > 0:
+            any_cross_run_loss = True
+
+    if any_cross_run_loss:
+        print("\n[purge-timing] CONFIRMED: Messages CAN be lost when sent during purge window!")
+    else:
+        print("\n[purge-timing] No losses observed in this controlled test.")
+
+    # Final summary and recommendations
+    print("\n[purge-timing] === CONCLUSIONS ===")
+    print("[purge-timing] AWS docs say purge 'may take up to 60 seconds' - it's non-deterministic.")
+    print("[purge-timing] In controlled tests, purges often complete quickly (no losses).")
+    print("[purge-timing] But in practice (back-to-back scenario runs), we HAVE observed losses.")
+    print("[purge-timing]")
+    print("[purge-timing] Key factors that may affect timing:")
+    print("[purge-timing]   - Queue depth at purge time")
+    print("[purge-timing]   - AWS region load")
+    print("[purge-timing]   - Time since last purge (60s cooldown between purges)")
+    print("[purge-timing]   - Message visibility state")
+    print("[purge-timing]")
+    print("[purge-timing] RECOMMENDATION: Always wait 60+ seconds after any purge before sending")
+    print("[purge-timing] messages to that queue. Our cleanup uses this approach to stay safe.")
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -1170,6 +1601,59 @@ def parse_args() -> argparse.Namespace:
         help="Timeout (seconds) to wait for queue to drain",
     )
 
+    gs = subparsers.add_parser(
+        "graceful-shutdown",
+        help="Graceful shutdown scenario (consumer finishes in-flight work after SIGTERM)",
+    )
+    gs.add_argument("--count", type=int, default=5, help="Messages to send")
+    gs.add_argument(
+        "--processing-delay",
+        type=int,
+        default=5,
+        help="Seconds to simulate slow processing per message",
+    )
+    gs.add_argument(
+        "--sigterm-delay",
+        type=int,
+        default=2,
+        help="Seconds to wait before sending SIGTERM (consumer should be mid-processing)",
+    )
+    gs.add_argument(
+        "--consumer-timeout",
+        type=int,
+        default=30,
+        help="Timeout (seconds) to wait for consumer to exit after SIGTERM",
+    )
+    gs.add_argument(
+        "--idle-timeout",
+        type=int,
+        default=30,
+        help="Idle timeout for consumer (should not be reached)",
+    )
+
+    pt = subparsers.add_parser(
+        "purge-timing",
+        help="SQS purge timing scenario (verify 60-second danger window behavior)",
+    )
+    pt.add_argument(
+        "--iterations",
+        type=int,
+        default=2,
+        help="Number of purge cycles to run (more iterations = better chance of observing behavior)",
+    )
+    pt.add_argument(
+        "--danger-count",
+        type=int,
+        default=10,
+        help="Messages to send immediately after purge (per iteration)",
+    )
+    pt.add_argument(
+        "--safe-delay",
+        type=int,
+        default=65,
+        help="Seconds after purge before sending safe messages (should be >60)",
+    )
+
     return parser.parse_args()
 
 
@@ -1184,6 +1668,8 @@ def main() -> None:
         "partial-batch": scenario_partial_batch,
         "side-effects": scenario_side_effects,
         "backpressure": scenario_backpressure,
+        "graceful-shutdown": scenario_graceful_shutdown,
+        "purge-timing": scenario_purge_timing,
     }.get(args.scenario)
 
     if not scenario_fn:

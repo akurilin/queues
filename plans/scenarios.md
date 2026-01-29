@@ -3,7 +3,7 @@
 This file captures the agreed plan, schemas, and Terraform sketch so work can be resumed without the prior conversation. No changes have been applied yet—this is a blueprint.
 
 ## Goals
-- Add runnable scenarios to exercise SQS queue behaviors (happy path + 10 deviations) using existing producer/consumer scripts.
+- Add runnable scenarios to exercise SQS queue behaviors (happy path + 9 deviations) using existing producer/consumer scripts.
 - Keep AWS costs low (small message counts; short runs; on-demand DynamoDB; minimal ECS scale).
 - Provide a Python-based runner to orchestrate scenarios and assert PASS/FAIL.
 - Extend infrastructure with DynamoDB side-effect tables and ECS autoscaling on SQS backlog.
@@ -30,23 +30,40 @@ This file captures the agreed plan, schemas, and Terraform sketch so work can be
 7) **Partial Batch Failure**
    SQS lets you receive up to 10 messages per poll. If the consumer processes 8 successfully but fails on 2, it needs to delete only the 8 and leave the 2 for redelivery. The naive approach — treating the batch as all-or-nothing — either loses successful work (if you fail the whole batch) or silently drops failures (if you succeed the whole batch). In production, most consumers poll in batches for throughput, so getting this wrong means either reprocessing messages unnecessarily or losing them. AWS added the `ReportBatchItemFailures` feature for Lambda specifically because this is so common to get wrong. Assert that successful messages are deleted, failed messages are redelivered, and no messages are lost or duplicated unnecessarily.
 
-8) **Visibility Timeout Extension**
-   When a consumer picks up a message, it becomes invisible to other consumers for the visibility timeout period. If processing takes longer than that — say a downstream API is slow, or the work is just heavy — the message becomes visible again and another consumer picks it up. The duplicates scenario demonstrates the *consequence* of this (duplicate delivery), but this scenario demonstrates the *mitigation*: calling `ChangeMessageVisibility` to extend the timeout while still processing. In production, processing time is variable and unpredictable. Without heartbeating/extending visibility, any slow message becomes a duplicate, which at scale creates a storm of redundant work. Assert that the consumer extends visibility during long processing and that no duplicate delivery occurs despite processing time exceeding the original visibility timeout.
+8) **Graceful Consumer Shutdown** ✅ IMPLEMENTED
+   Every time you deploy, scale down, or restart a consumer, the process receives a SIGTERM. If the consumer is mid-processing, it has two choices: drop the message (it'll come back after visibility timeout, but you've wasted work and added latency) or finish processing before exiting. In containerized environments like ECS, this happens on every deployment. If the consumer doesn't handle SIGTERM, you get a burst of redeliveries after every deploy, plus a window where messages sit unprocessed until the visibility timeout expires. The stop timeout in ECS defaults to 30 seconds before SIGKILL, so the consumer has a finite window to wrap up.
 
-9) **Graceful Consumer Shutdown**
-   Every time you deploy, scale down, or restart a consumer, the process receives a SIGTERM. If the consumer is mid-processing, it has two choices: drop the message (it'll come back after visibility timeout, but you've wasted work and added latency) or finish processing before exiting. In containerized environments like ECS, this happens on every deployment. If the consumer doesn't handle SIGTERM, you get a burst of redeliveries after every deploy, plus a window where messages sit unprocessed until the visibility timeout expires. The stop timeout in ECS defaults to 30 seconds before SIGKILL, so the consumer has a finite window to wrap up. Assert that the consumer finishes in-flight messages after receiving SIGTERM, stops polling for new messages, and exits cleanly without orphaning messages.
+   **Implementation**: Consumer registers a SIGTERM handler that sets a `shutdown_requested` flag. The main loop checks this flag before polling and after processing each message. When set, it breaks out of the loop and exits cleanly with code 0. The scenario sends 5 messages, starts a consumer with 5s processing delay, waits 2s (consumer is mid-processing), sends SIGTERM, then asserts: consumer exits 0, exactly 1 side effect in DynamoDB, 4 messages remaining in queue, DLQ empty.
 
-10) **Out-of-Order Processing**
+   **Verification**: The scenario measures time between SIGTERM and consumer exit. If the consumer exits ~5s after SIGTERM (matching the remaining processing time), we have proof it finished in-flight work. If it exited immediately, the SIGTERM arrived before processing started. Example output: `Consumer exited 5.4s after SIGTERM (finished in-flight work before exiting)`
+
+9) **Out-of-Order Processing**
     Standard SQS makes no ordering guarantees. If a producer sends events A, B, C representing a sequence (e.g., `order_created`, `order_updated`, `order_cancelled`), consumers might receive them as B, A, C or any other permutation. If the consumer applies these as state transitions, processing `order_updated` before `order_created` either fails or corrupts state. Production systems handle this with version numbers, timestamps, or last-write-wins semantics. FIFO queues exist but come with throughput tradeoffs (300 msg/s without batching, 3000 with). Most production systems use standard queues and handle ordering in application logic, so understanding and demonstrating that tradeoff is important. Assert that final state is correct regardless of delivery order, using version-based or timestamp-based reconciliation logic.
 
-11) **Queue Backlog Drain After Outage**
+10) **Queue Backlog Drain After Outage**
     When the consumer goes down — a bad deploy, an infrastructure issue, a downstream dependency outage — messages pile up. When the consumer comes back, it faces a backlog of potentially thousands of messages. This stresses several things at once: can you scale consumers horizontally to drain faster? Do your downstream dependencies handle the burst? Does your idempotency logic hold up under load? Are messages still valid or have some expired/become stale? This is distinct from normal steady-state processing and is the scenario most likely to expose problems you didn't find during normal operation. Every production queue system eventually has an outage, and the recovery is often harder than the outage itself. Assert that the backlog drains fully, no messages are lost, idempotency holds under concurrent consumer load, and stale messages are handled gracefully.
+
+11) **SQS Purge Timing** ✅ IMPLEMENTED (diagnostic scenario)
+    SQS PurgeQueue is asynchronous — the API returns immediately but deletion continues for up to 60 seconds. Messages sent during this window can be silently deleted. This scenario exists to verify our understanding of this behavior and document it for the team.
+
+    **What we learned**:
+    - AWS docs say purge "may take up to 60 seconds" — it's non-deterministic
+    - In controlled tests (same process), purges often complete quickly (no message loss observed)
+    - In practice (back-to-back scenario runs), we DID observe message loss
+    - The `ApproximateNumberOfMessages` attribute can be misleading during purge
+
+    **Key factors affecting timing**:
+    - Queue depth at purge time
+    - AWS region load
+    - Time since last purge (60s cooldown between purges)
+    - Message visibility state
+
+    **Our mitigation**: The scenario runner waits 60s after any purge before sending new messages. When no purge is needed (queue already empty), it waits 10s as a safety buffer in case a previous run's purge is still active.
 
 ## Code Changes Needed (not yet applied)
 - **Consumer (`consumer/consume.py`)**
   - Add flags/envs:
     - `NO_DELETE_AFTER_PROCESS` (simulate delete drop)
-    - `VISIBILITY_EXTENSION_SECONDS`, `EXTEND_EVERY_N` (heartbeat/extend visibility)
     - DynamoDB integration: table names, conditional writes for STARTED/COMPLETED; optional `TRANSactWrite` for atomic completion.
   - Side-effect hooks to write to DynamoDB tables with idempotency.
 
@@ -169,10 +186,10 @@ This file captures the agreed plan, schemas, and Terraform sketch so work can be
 - **5 Backpressure**: High producer rate; observe backlog; autoscaling scales out to drain; scales in after cooldown.
 - **6 Downstream**: DynamoDB writes are the side effect; show crash after side effect before delete; ensure conditional write prevents double side effect; completion table has one entry per message.
 - **7 Partial Batch Failure**: Producer sends batch of messages with some intentionally malformed; consumer receives batch, processes good ones, fails bad ones; assert good messages deleted, bad messages redelivered; no messages lost.
-- **8 Visibility Timeout Extension**: Consumer processes a slow message but heartbeats `ChangeMessageVisibility` to extend the timeout; assert no duplicate delivery despite processing time exceeding original visibility timeout.
-- **9 Graceful Shutdown**: Consumer is mid-processing when it receives SIGTERM; assert it finishes in-flight work, stops polling, exits cleanly, and no messages are orphaned or unnecessarily redelivered.
-- **10 Out-of-Order**: Producer sends sequenced events (v1, v2, v3); consumer receives them out of order; assert final state is correct using version/timestamp reconciliation logic.
-- **11 Backlog Drain**: Consumer is offline while producer sends a large burst; consumer(s) come back online and drain the backlog; assert all messages processed, idempotency holds under load, no messages lost.
+- **8 Graceful Shutdown**: ✅ Consumer registers SIGTERM handler; scenario sends 5 messages with 5s processing delay; SIGTERM sent after 2s; consumer finishes message 1, exits 0; timing verification proves work completed after SIGTERM; assert 1 side effect, 4 messages in queue, DLQ empty.
+- **9 Out-of-Order**: Producer sends sequenced events (v1, v2, v3); consumer receives them out of order; assert final state is correct using version/timestamp reconciliation logic.
+- **10 Backlog Drain**: Consumer is offline while producer sends a large burst; consumer(s) come back online and drain the backlog; assert all messages processed, idempotency holds under load, no messages lost.
+- **11 Purge Timing**: ✅ Diagnostic scenario to verify SQS purge behavior. Runs multiple iterations sending messages at various delays after purge (0s, 5s, 15s, 30s, 45s, 60s, 65s). Documents that purge timing is non-deterministic but messages after 60s are safe.
 
 ## Why Python Runner (vs. shell)
 - Shell + `aws`/`jq` can work but gets unwieldy for waits/assertions and DynamoDB condition logic. Python can reuse boto3, cleanly express assertions, and handle retries.

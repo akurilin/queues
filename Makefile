@@ -1,5 +1,5 @@
 .PHONY: help preflight infra-up infra-down infra-validate validate \
-       scenario-happy scenario-crash scenario-duplicates scenario-poison scenario-partial-batch scenario-side-effects scenario-backpressure \
+       scenario-happy scenario-crash scenario-duplicates scenario-poison scenario-partial-batch scenario-side-effects scenario-graceful-shutdown scenario-purge-timing scenario-backpressure \
        scenarios scenarios-fast scenarios-slow venv
 
 ARGS ?=
@@ -82,7 +82,13 @@ scenario-partial-batch: $(VENV_STAMP) ## Run the partial batch failure scenario
 scenario-side-effects: $(VENV_STAMP) ## Run the transactional side effects scenario
 	$(VENV)/bin/python scenarios/run.py side-effects $(ARGS)
 
-scenarios-fast: scenario-happy scenario-crash scenario-duplicates scenario-poison scenario-partial-batch scenario-side-effects ## Run fast scenarios only
+scenario-graceful-shutdown: $(VENV_STAMP) ## Run the graceful shutdown scenario
+	$(VENV)/bin/python scenarios/run.py graceful-shutdown $(ARGS)
+
+scenario-purge-timing: $(VENV_STAMP) ## Run the SQS purge timing scenario (~70s, tests 60s danger window)
+	$(VENV)/bin/python scenarios/run.py purge-timing $(ARGS)
+
+scenarios-fast: scenario-happy scenario-crash scenario-duplicates scenario-poison scenario-partial-batch scenario-side-effects scenario-graceful-shutdown ## Run fast scenarios only
 
 # --- Slow scenarios (minutes) ---
 

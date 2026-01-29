@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import random
+import signal
 import sys
 import time
 from collections import deque
@@ -20,6 +21,20 @@ class CrashError(Exception):
 
 
 logger = logging.getLogger("consumer")
+
+# Global flag for graceful shutdown
+shutdown_requested = False
+
+
+def handle_sigterm(signum: int, frame: Any) -> None:
+    """Handle SIGTERM by setting the shutdown flag."""
+    global shutdown_requested
+    shutdown_requested = True
+    logger.info("Received SIGTERM, finishing current work before exiting...")
+
+
+# Register SIGTERM handler
+signal.signal(signal.SIGTERM, handle_sigterm)
 
 
 def env_int(name: str, default: int) -> int:
@@ -357,6 +372,11 @@ def main() -> None:
     try:
         # Infinite loop to continuously poll for messages
         while True:
+            # Check for graceful shutdown before polling
+            if shutdown_requested:
+                logger.info("Shutdown requested, exiting main loop")
+                break
+
             # Poll SQS for messages (long polling if wait_time > 0)
             response = sqs.receive_message(
                 QueueUrl=queue_url,
@@ -403,6 +423,10 @@ def main() -> None:
                     if message_limit and processed_count >= message_limit:
                         logger.info("Message limit %s reached; exiting", message_limit)
                         # Exit gracefully when limit reached
+                        return
+                    # Check for graceful shutdown after processing each message
+                    if shutdown_requested:
+                        logger.info("Shutdown requested after processing message, exiting")
                         return
                 # Handle intentional crashes (chaos testing)
                 except CrashError:
