@@ -9,6 +9,7 @@ Infrastructure + scenario runner showcasing happy paths and many failure modes o
 - **Happy path** (`make scenario-happy`): messages flow through cleanly, all processed and deleted.
 - **Crash recovery** (`make scenario-crash`): consumer crashes after receiving; observe redelivery and recovery.
 - **Duplicate delivery** (`make scenario-duplicates`): slow processing triggers visibility timeout, causing redelivery; DynamoDB-backed idempotency prevents duplicate side effects.
+- **Business idempotency** (`make scenario-business-idempotency`): two different message IDs represent the same logical work; consumer dedupes on a business key (e.g., `order_id`).
 - **Poison messages** (`make scenario-poison`): messages with a poison marker are rejected and redrive to the DLQ after max retries.
 - **Partial batch failure** (`make scenario-partial-batch`): consumer receives batches of 10 messages containing both good and poison messages; good messages are processed and deleted individually while poison messages are retried and eventually land in the DLQ.
 - **External side effects** (`make scenario-side-effects`): consumer uses the check-before-doing pattern to handle external side effects; proves no duplicate side effects occur even when crashing after the side effect but before updating status.
@@ -117,6 +118,7 @@ Producer (local)  ──▶  SQS Queue  ──▶  Consumer (local)  ──▶  
 | `MESSAGE_SIDE_EFFECTS_TABLE` | *(optional)* | DynamoDB table name for side effects (simulates external service) |
 | `SIDE_EFFECT_DELAY_SECONDS` | `0.0` | Delay before side effect to simulate slow external service (for visibility timeout testing) |
 | `CRASH_AFTER_SIDE_EFFECT` | `0` | Crash after side effect but before marking complete (for testing idempotency) |
+| `BUSINESS_IDEMPOTENCY_FIELD` | *(empty)* | Payload field name to dedupe external side effects (e.g., `order_id`) |
 | `LOG_LEVEL` | `INFO` | Logging level (DEBUG, INFO, WARNING, ERROR) |
 
 ## Producer usage
@@ -167,6 +169,7 @@ Each message contains a JSON payload with a UUID `id` and a random `work` value 
   ```bash
   make scenario-happy
   make scenario-crash
+  make scenario-business-idempotency
   ```
 - Pass extra arguments via `ARGS`:
   ```bash

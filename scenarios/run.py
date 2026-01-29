@@ -28,6 +28,7 @@ SCENARIO_TF_KEYS = {
     "happy": "happy",
     "crash": "crash",
     "duplicates": "dup",
+    "business-idempotency": "business",
     "poison": "poison",
     "partial-batch": "poison",  # reuses poison scenario infrastructure
     "side-effects": "dup",  # reuses dup infrastructure (has DynamoDB + short visibility)
@@ -537,6 +538,96 @@ def scenario_duplicates(args: argparse.Namespace, outputs: Dict) -> None:
 
     print(
         f"[dup] PASS | attempts={attempts} completion_timestamp={completed_item.get('processed_at')}"
+    )
+
+
+def scenario_business_idempotency(args: argparse.Namespace, outputs: Dict) -> None:
+    """Scenario: Business idempotency — two different message IDs represent the
+    same logical work (order_id), so side effects should only happen once.
+    """
+    queue_url = outputs["queue_url"]
+    region = outputs["aws_region"]
+    profile = os.environ.get("AWS_PROFILE", "")
+    status_table_name = outputs["message_status_table"]
+    side_effects_table_name = outputs["message_side_effects_table"]
+
+    dlq_url = queue_url_from_arn(outputs["dlq_arn"])
+    sqs = build_sqs_client(region, profile)
+    dynamo = build_dynamo_resource(region, profile)
+    cleanup_scenario_state(sqs, dynamo, outputs, "business-idempotency")
+
+    order_id = f"order-{uuid.uuid4()}"
+    payloads = [
+        {"id": str(uuid.uuid4()), "order_id": order_id, "work": "charge"},
+        {"id": str(uuid.uuid4()), "order_id": order_id, "work": "charge"},
+    ]
+
+    print(f"[business-idempotency] Sending 2 messages for order_id={order_id} ...")
+    for payload in payloads:
+        sqs.send_message(QueueUrl=queue_url, MessageBody=json.dumps(payload))
+    wait_for_messages_enqueued(sqs, queue_url, expected=2)
+
+    print("[business-idempotency] Running consumer with BUSINESS_IDEMPOTENCY_FIELD=order_id ...")
+    exit_code = run_local_consumer(
+        env={
+            "QUEUE_URL": queue_url,
+            "AWS_REGION": region,
+            "MESSAGE_STATUS_TABLE": status_table_name,
+            "MESSAGE_SIDE_EFFECTS_TABLE": side_effects_table_name,
+            "BUSINESS_IDEMPOTENCY_FIELD": "order_id",
+            "MESSAGE_LIMIT": "2",
+            "IDLE_TIMEOUT_SECONDS": str(args.idle_timeout),
+            "LOG_LEVEL": "INFO",
+            "MAX_MESSAGES": "1",
+            "WAIT_TIME_SECONDS": "1",
+        },
+        timeout=args.consumer_timeout,
+    )
+    if exit_code != 0:
+        raise RuntimeError(f"Business idempotency consumer failed with exit code {exit_code}")
+
+    print("[business-idempotency] Waiting for queue to drain ...")
+    wait_for_queue_empty(sqs, queue_url, timeout=args.queue_timeout)
+    ensure_queue_empty(sqs, dlq_url, "DLQ")
+
+    side_effects_table = dynamo.Table(side_effects_table_name)
+    side_effects_count = 0
+    scan_kw: Dict = {"Select": "COUNT"}
+    while True:
+        resp = side_effects_table.scan(**scan_kw)
+        side_effects_count += resp["Count"]
+        if "LastEvaluatedKey" not in resp:
+            break
+        scan_kw["ExclusiveStartKey"] = resp["LastEvaluatedKey"]
+
+    expected_key = f"biz:order_id:{order_id}"
+    side_effect_item = side_effects_table.get_item(
+        Key={"message_id": expected_key}
+    ).get("Item")
+
+    if side_effects_count != 1 or not side_effect_item:
+        raise RuntimeError(
+            f"Expected 1 side effect for business key {expected_key}, "
+            f"found count={side_effects_count}"
+        )
+
+    status_table = dynamo.Table(status_table_name)
+    status_count = 0
+    scan_kw = {"Select": "COUNT", "FilterExpression": "#s = :completed"}
+    scan_kw["ExpressionAttributeNames"] = {"#s": "status"}
+    scan_kw["ExpressionAttributeValues"] = {":completed": "COMPLETED"}
+    while True:
+        resp = status_table.scan(**scan_kw)
+        status_count += resp["Count"]
+        if "LastEvaluatedKey" not in resp:
+            break
+        scan_kw["ExclusiveStartKey"] = resp["LastEvaluatedKey"]
+
+    if status_count != 2:
+        raise RuntimeError(f"Expected 2 COMPLETED statuses, found {status_count}")
+
+    print(
+        f"[business-idempotency] PASS | order_id={order_id} side_effects=1 statuses=2"
     )
 
 
@@ -1490,6 +1581,29 @@ def parse_args() -> argparse.Namespace:
         help="Timeout (seconds) to wait for queue to drain",
     )
 
+    biz = subparsers.add_parser(
+        "business-idempotency",
+        help="Business idempotency scenario (dedupe by business key)",
+    )
+    biz.add_argument(
+        "--idle-timeout",
+        type=int,
+        default=30,
+        help="Idle timeout for consumer to exit when queue is empty",
+    )
+    biz.add_argument(
+        "--consumer-timeout",
+        type=int,
+        default=120,
+        help="Timeout (seconds) for consumer subprocess",
+    )
+    biz.add_argument(
+        "--queue-timeout",
+        type=int,
+        default=120,
+        help="Timeout (seconds) to wait for queue to drain",
+    )
+
     poison = subparsers.add_parser("poison", help="Poison message scenario (bad messages go to DLQ)")
     poison.add_argument("--count", type=int, default=5, help="Total messages to send")
     poison.add_argument("--poison-count", type=int, default=2, help="Number of poison messages")
@@ -1664,6 +1778,7 @@ def main() -> None:
         "happy": scenario_happy,
         "crash": scenario_crash,
         "duplicates": scenario_duplicates,
+        "business-idempotency": scenario_business_idempotency,
         "poison": scenario_poison,
         "partial-batch": scenario_partial_batch,
         "side-effects": scenario_side_effects,

@@ -194,20 +194,26 @@ class DynamoTracker:
             return "completed"
         return "existing"
 
-    def check_side_effect_exists(self, message_id: str) -> bool:
+    def check_side_effect_exists(self, side_effect_key: str) -> bool:
         """Check if the side effect was already performed.
 
         This is the critical check-before-doing step. Before calling an
         external service (or simulating one), check if we already did it.
         """
         try:
-            response = self.side_effects_table.get_item(Key={"message_id": message_id})
+            response = self.side_effects_table.get_item(
+                Key={"message_id": side_effect_key}
+            )
             return "Item" in response
         except ClientError as exc:
-            logger.warning("Failed to check side effect for %s: %s", message_id, exc)
+            logger.warning(
+                "Failed to check side effect for %s: %s", side_effect_key, exc
+            )
             return False
 
-    def do_side_effect(self, message_id: str, payload: Any) -> str:
+    def do_side_effect(
+        self, side_effect_key: str, payload: Any, message_id: Optional[str] = None
+    ) -> str:
         """Perform the side effect (simulates calling an external service).
 
         This represents the external call — like Stripe recording a transfer,
@@ -222,19 +228,20 @@ class DynamoTracker:
         try:
             self.side_effects_table.put_item(
                 Item={
-                    "message_id": message_id,
+                    "message_id": side_effect_key,
                     "performed_at": timestamp,
                     "payload_digest": digest,
+                    "original_message_id": message_id or "",
                 },
                 ConditionExpression="attribute_not_exists(message_id)",
             )
-            logger.info("Side effect performed for message_id=%s", message_id)
+            logger.info("Side effect performed for key=%s", side_effect_key)
             return "new"
         except ClientError as exc:
             if self._is_conditional_failure(exc):
-                logger.info("Side effect already exists for message_id=%s", message_id)
+                logger.info("Side effect already exists for key=%s", side_effect_key)
                 return "already_done"
-            logger.warning("Failed to perform side effect for %s: %s", message_id, exc)
+            logger.warning("Failed to perform side effect for %s: %s", side_effect_key, exc)
             raise
 
     def mark_completed(self, message_id: str) -> None:
@@ -305,6 +312,8 @@ def main() -> None:
     crash_after_side_effect = bool(env_int("CRASH_AFTER_SIDE_EFFECT", 0))
     # Delay before side effect to simulate slow external service (for visibility timeout testing)
     side_effect_delay = env_float("SIDE_EFFECT_DELAY_SECONDS", 0.0)
+    # Optional business idempotency field (payload key to dedupe external side effects)
+    business_idempotency_field = os.getenv("BUSINESS_IDEMPOTENCY_FIELD", "").strip()
 
     # Log startup configuration so user knows what behavior is enabled
     logger.info(
@@ -418,6 +427,7 @@ def main() -> None:
                         reject_payload_marker,
                         crash_after_side_effect,
                         side_effect_delay,
+                        business_idempotency_field,
                     )
                     # Check if we've hit the optional message limit (for testing)
                     if message_limit and processed_count >= message_limit:
@@ -462,6 +472,7 @@ def handle_message(
     reject_payload_marker: str = "",
     crash_after_side_effect: bool = False,
     side_effect_delay: float = 0.0,
+    business_idempotency_field: str = "",
 ) -> None:
     """Process a single message using the check-before-doing pattern.
 
@@ -490,6 +501,18 @@ def handle_message(
         message_id = payload.get("id")
     # Fall back to SQS-generated MessageId if no custom ID found
     message_id = message_id or message.get("MessageId")
+
+    # Resolve side-effect idempotency key (business key overrides message id)
+    side_effect_key = message_id
+    if business_idempotency_field and isinstance(payload, dict):
+        if business_idempotency_field in payload:
+            business_value = str(payload[business_idempotency_field])
+            side_effect_key = f"biz:{business_idempotency_field}:{business_value}"
+        else:
+            logger.warning(
+                "Business idempotency field %r missing in payload; falling back to message id",
+                business_idempotency_field,
+            )
 
     # Step 1: Record that we're starting to process this message
     tracker_state = None
@@ -526,9 +549,12 @@ def handle_message(
     side_effect_state = None
     if message_id and dynamo_tracker:
         # Step 2: Check if side effect was already performed
-        if dynamo_tracker.check_side_effect_exists(message_id):
+        if side_effect_key and dynamo_tracker.check_side_effect_exists(side_effect_key):
             # Side effect already done (we crashed after step 3 but before step 5)
-            logger.info("Side effect already exists for id=%s, skipping to completion", message_id)
+            logger.info(
+                "Side effect already exists for key=%s, skipping to completion",
+                side_effect_key,
+            )
             side_effect_state = "already_done"
         else:
             # Optional delay to simulate slow external service (for visibility timeout testing)
@@ -536,7 +562,11 @@ def handle_message(
                 logger.info("Simulating slow external service: sleeping %.1fs", side_effect_delay)
                 time.sleep(side_effect_delay)
             # Step 3: Perform the side effect (simulates external service call)
-            side_effect_state = dynamo_tracker.do_side_effect(message_id, payload)
+            side_effect_state = dynamo_tracker.do_side_effect(
+                side_effect_key or message_id,
+                payload,
+                message_id=message_id,
+            )
 
         # Step 4: Crash point for testing — side effect done but not marked complete
         if crash_after_side_effect:

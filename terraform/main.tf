@@ -5,6 +5,7 @@ locals {
     happy  = "${local.name}-happy"
     crash  = "${local.name}-crash"
     dup    = "${local.name}-dup"
+    business = "${local.name}-business-idempotency"
     poison       = "${local.name}-poison"
     backpressure = "${local.name}-backpressure"
   }
