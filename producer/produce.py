@@ -48,6 +48,12 @@ def parse_args() -> argparse.Namespace:
         default=0,
         help="Number of messages to send with a poison payload",
     )
+    parser.add_argument(
+        "--poison-every",
+        type=int,
+        default=0,
+        help="Make every Nth message poison (0 to disable). Overrides --poison-count.",
+    )
     return parser.parse_args()
 
 
@@ -122,10 +128,18 @@ def main() -> None:
     total = max(args.n, 0)
     continuous = total == 0
     # Compute global indices for poison messages (only for finite runs)
-    poison_count = max(0, min(args.poison_count, total)) if not continuous else 0
-    poison_indices: set[int] = set(random.sample(range(total), poison_count)) if poison_count else set()
-    if poison_count:
-        logging.info("Poison messages (%s) at indices: %s", poison_count, sorted(poison_indices))
+    poison_indices: set[int] = set()
+    if not continuous:
+        if args.poison_every > 0:
+            # Pattern-based: every Nth message starting at index (N-1)
+            # e.g., --poison-every 3 -> indices 2, 5, 8, 11, ...
+            poison_indices = {i for i in range(args.poison_every - 1, total, args.poison_every)}
+        elif args.poison_count > 0:
+            # Random sampling (original behavior)
+            poison_count = max(0, min(args.poison_count, total))
+            poison_indices = set(random.sample(range(total), poison_count))
+    if poison_indices:
+        logging.info("Poison messages (%s) at indices: %s", len(poison_indices), sorted(poison_indices))
     # Track successful message sends for final statistics
     sent = 0
     # Track failed message sends for error reporting

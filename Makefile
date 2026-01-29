@@ -1,5 +1,5 @@
 .PHONY: help preflight infra-up infra-down infra-validate validate \
-       scenario-happy scenario-crash scenario-duplicates scenario-poison scenario-backpressure \
+       scenario-happy scenario-crash scenario-duplicates scenario-poison scenario-partial-batch scenario-backpressure \
        scenarios scenarios-fast scenarios-slow venv
 
 ARGS ?=
@@ -76,7 +76,10 @@ scenario-duplicates: $(VENV_STAMP) ## Run the duplicates scenario
 scenario-poison: $(VENV_STAMP) ## Run the poison message scenario
 	$(VENV)/bin/python scenarios/run.py poison $(ARGS)
 
-scenarios-fast: scenario-happy scenario-crash scenario-duplicates scenario-poison ## Run fast scenarios only
+scenario-partial-batch: $(VENV_STAMP) ## Run the partial batch failure scenario
+	$(VENV)/bin/python scenarios/run.py partial-batch $(ARGS)
+
+scenarios-fast: scenario-happy scenario-crash scenario-duplicates scenario-poison scenario-partial-batch ## Run fast scenarios only
 
 # --- Slow scenarios (minutes) ---
 

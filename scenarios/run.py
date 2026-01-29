@@ -29,6 +29,7 @@ SCENARIO_TF_KEYS = {
     "crash": "crash",
     "duplicates": "dup",
     "poison": "poison",
+    "partial-batch": "poison",  # reuses poison scenario infrastructure
     "backpressure": "backpressure",
 }
 
@@ -294,6 +295,7 @@ def run_producer_async(
     profile: str,
     rate: Optional[int] = None,
     poison_count: int = 0,
+    poison_every: int = 0,
     quiet: bool = False,
 ) -> subprocess.Popen:
     """Start the producer script as a background subprocess. Returns the Popen handle."""
@@ -311,7 +313,9 @@ def run_producer_async(
     ]
     if rate is not None:
         cmd.extend(["--rate", str(rate)])
-    if poison_count > 0:
+    if poison_every > 0:
+        cmd.extend(["--poison-every", str(poison_every)])
+    elif poison_count > 0:
         cmd.extend(["--poison-count", str(poison_count)])
     if profile:
         cmd.extend(["--profile", profile])
@@ -331,6 +335,7 @@ def run_producer(
     queue_url: str,
     profile: str,
     poison_count: int = 0,
+    poison_every: int = 0,
 ) -> None:
     """Invoke the producer script to push messages."""
     cmd = [
@@ -345,7 +350,9 @@ def run_producer(
         "--batch-size",
         str(batch_size),
     ]
-    if poison_count > 0:
+    if poison_every > 0:
+        cmd.extend(["--poison-every", str(poison_every)])
+    elif poison_count > 0:
         cmd.extend(["--poison-count", str(poison_count)])
     if profile:
         cmd.extend(["--profile", profile])
@@ -577,6 +584,96 @@ def scenario_poison(args: argparse.Namespace, outputs: Dict) -> None:
         )
 
     print(f"[poison] PASS | good={good_count} processed, poison={poison_count} in DLQ")
+
+
+def scenario_partial_batch(args: argparse.Namespace, outputs: Dict) -> None:
+    """Scenario 5: Partial batch failure — consumer receives batches of 10,
+    processes some successfully and fails on poison messages.
+
+    Demonstrates correct handling when a batch contains both good and bad
+    messages: good messages are deleted, poison messages are retried until
+    they exhaust retries and land in the DLQ.
+    """
+    queue_url = outputs["queue_url"]
+    region = outputs["aws_region"]
+    profile = os.environ.get("AWS_PROFILE", "")
+    dlq_url = queue_url_from_arn(outputs["dlq_arn"])
+    completed_table_name = outputs["message_completed_table"]
+    sqs = build_sqs_client(region, profile)
+    dynamo = build_dynamo_resource(region, profile)
+    cleanup_scenario_state(sqs, dynamo, outputs, "partial-batch")
+
+    total_count = args.count
+    poison_every = args.poison_every
+    # Calculate expected poison count: indices (poison_every-1), (2*poison_every-1), ...
+    expected_poison = len(range(poison_every - 1, total_count, poison_every))
+    expected_good = total_count - expected_poison
+
+    print(
+        f"[partial-batch] Sending {total_count} messages "
+        f"(every {poison_every}th is poison: {expected_poison} poison, {expected_good} good) ..."
+    )
+    run_producer(
+        total_count,
+        batch_size=10,
+        region=region,
+        queue_url=queue_url,
+        profile=profile,
+        poison_every=poison_every,
+    )
+    print("[partial-batch] Confirming messages are enqueued ...")
+    wait_for_messages_enqueued(sqs, queue_url, total_count)
+
+    print("[partial-batch] Running consumer with MAX_MESSAGES=10, REJECT_PAYLOAD_MARKER=POISON ...")
+    consumer_env = {
+        "QUEUE_URL": queue_url,
+        "AWS_REGION": region,
+        "REJECT_PAYLOAD_MARKER": "POISON",
+        "IDLE_TIMEOUT_SECONDS": str(args.idle_timeout),
+        "LOG_LEVEL": "INFO",
+        "MAX_MESSAGES": "10",
+        "WAIT_TIME_SECONDS": "5",
+    }
+    if outputs.get("message_status_table") and outputs.get("message_completed_table"):
+        consumer_env["MESSAGE_STATUS_TABLE"] = outputs["message_status_table"]
+        consumer_env["MESSAGE_COMPLETED_TABLE"] = outputs["message_completed_table"]
+
+    exit_code = run_local_consumer(env=consumer_env, timeout=args.consumer_timeout)
+    if exit_code != 0:
+        raise RuntimeError(f"Partial-batch consumer failed with exit code {exit_code}")
+
+    print("[partial-batch] Waiting for main queue to fully drain ...")
+    wait_for_queue_empty(sqs, queue_url, timeout=args.queue_timeout)
+
+    print("[partial-batch] Checking DLQ for poison messages ...")
+    dlq_depth = get_queue_depth(sqs, dlq_url)
+    dlq_count = dlq_depth["visible"] + dlq_depth["not_visible"]
+    if dlq_count != expected_poison:
+        raise RuntimeError(
+            f"Expected {expected_poison} messages in DLQ, found {dlq_count} "
+            f"(visible={dlq_depth['visible']}, not_visible={dlq_depth['not_visible']})"
+        )
+
+    # Verify DynamoDB completions
+    completed_table = dynamo.Table(completed_table_name)
+    completed_count = 0
+    scan_kw: Dict = {"Select": "COUNT"}
+    while True:
+        resp = completed_table.scan(**scan_kw)
+        completed_count += resp["Count"]
+        if "LastEvaluatedKey" not in resp:
+            break
+        scan_kw["ExclusiveStartKey"] = resp["LastEvaluatedKey"]
+
+    if completed_count != expected_good:
+        raise RuntimeError(
+            f"Expected {expected_good} completed messages in DynamoDB, found {completed_count}"
+        )
+
+    print(
+        f"[partial-batch] PASS | good={expected_good} completed, "
+        f"poison={expected_poison} in DLQ"
+    )
 
 
 def scenario_backpressure(args: argparse.Namespace, outputs: Dict) -> None:
@@ -845,6 +942,35 @@ def parse_args() -> argparse.Namespace:
         help="Timeout (seconds) to wait for queue to drain",
     )
 
+    partial = subparsers.add_parser(
+        "partial-batch", help="Partial batch failure scenario (batch of 10 with mixed good/poison)"
+    )
+    partial.add_argument("--count", type=int, default=50, help="Total messages to send")
+    partial.add_argument(
+        "--poison-every",
+        type=int,
+        default=3,
+        help="Make every Nth message poison (e.g., 3 means indices 2, 5, 8...)",
+    )
+    partial.add_argument(
+        "--idle-timeout",
+        type=int,
+        default=30,
+        help="Idle timeout for consumer to exit when queue is drained",
+    )
+    partial.add_argument(
+        "--consumer-timeout",
+        type=int,
+        default=300,
+        help="Timeout (seconds) for consumer subprocess",
+    )
+    partial.add_argument(
+        "--queue-timeout",
+        type=int,
+        default=180,
+        help="Timeout (seconds) to wait for queue to drain",
+    )
+
     bp = subparsers.add_parser("backpressure", help="Backpressure / auto-scaling scenario")
     bp.add_argument("--rate", type=int, default=5, help="Producer messages per second")
     bp.add_argument("--batch-size", type=int, default=10, help="Producer batch size (<=10)")
@@ -881,6 +1007,7 @@ def main() -> None:
         "crash": scenario_crash,
         "duplicates": scenario_duplicates,
         "poison": scenario_poison,
+        "partial-batch": scenario_partial_batch,
         "backpressure": scenario_backpressure,
     }.get(args.scenario)
 

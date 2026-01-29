@@ -111,7 +111,8 @@ Producer (local)  ──▶  SQS Queue  ──▶  Consumer (local)  ──▶  
 - `--n` — number of messages to send (default 10)
 - `--rate` — messages/sec limit (`0` = as fast as possible)
 - `--batch-size` — messages per SQS batch call (max 10, default 10)
-- `--poison-count` — number of poison messages to inject (default 0)
+- `--poison-count` — number of poison messages to inject at random indices (default 0)
+- `--poison-every N` — make every Nth message poison (e.g., 3 means indices 2, 5, 8...); overrides `--poison-count`
 - `--queue-url` — override queue URL (defaults to `QUEUE_URL` env var)
 - `--region` — AWS region (defaults to `AWS_REGION` env var)
 - `--profile` — AWS profile (defaults to `AWS_PROFILE` env var)
@@ -145,6 +146,7 @@ Each message contains a JSON payload with a UUID `id` and a random `work` value 
 - **Crash recovery** (`make scenario-crash`): consumer crashes after receiving; observe redelivery and recovery.
 - **Duplicate delivery** (`make scenario-duplicates`): slow processing triggers visibility timeout, causing redelivery; DynamoDB-backed idempotency prevents duplicate side effects.
 - **Poison messages** (`make scenario-poison`): messages with a poison marker are rejected and redrive to the DLQ after max retries.
+- **Partial batch failure** (`make scenario-partial-batch`): consumer receives batches of 10 messages containing both good and poison messages; good messages are processed and deleted individually while poison messages are retried and eventually land in the DLQ.
 
 **Slow** (5–10 minutes):
 - **Backpressure / auto-scaling** (`make scenario-backpressure`): a continuous producer floods the queue; the runner monitors queue depth and spawns additional consumers until equilibrium.
@@ -153,7 +155,7 @@ Each message contains a JSON payload with a UUID `id` and a random `work` value 
 - **Prereqs**: infrastructure provisioned (`make infra-up`), AWS CLI + Terraform on PATH.
 - **Quick start** (venv is created automatically):
   ```bash
-  make scenarios-fast        # run the 4 fast scenarios
+  make scenarios-fast        # run the 5 fast scenarios
   make scenarios-slow        # run slow scenarios (backpressure)
   make scenarios             # run everything (fast then slow)
   ```
@@ -184,7 +186,7 @@ Run `make help` to see all targets. Key ones:
 | `make venv` | Create/update the project venv |
 | `make validate` | Validate scenario infrastructure is healthy |
 | `make scenario-*` | Run individual scenarios |
-| `make scenarios-fast` | Run the 4 fast scenarios |
+| `make scenarios-fast` | Run the 5 fast scenarios |
 | `make scenarios-slow` | Run slow scenarios (backpressure) |
 | `make scenarios` | Run all scenarios (fast then slow) |
 
