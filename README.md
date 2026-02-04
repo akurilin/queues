@@ -14,6 +14,7 @@ Infrastructure + scenario runner showcasing happy paths and many failure modes o
 - **Partial batch failure** (`make scenario-partial-batch`): consumer receives batches of 10 messages containing both good and poison messages; good messages are processed and deleted individually while poison messages are retried and eventually land in the DLQ.
 - **External side effects** (`make scenario-side-effects`): consumer uses the check-before-doing pattern to handle external side effects; proves no duplicate side effects occur even when crashing after the side effect but before updating status.
 - **Graceful shutdown** (`make scenario-graceful-shutdown`): consumer receives SIGTERM mid-processing and finishes in-flight work before exiting cleanly.
+- **FIFO ordering** (`make scenario-fifo-order`): FIFO queue with a single message group verifies in-order delivery using a shared JSON log file.
 
 **Slow** (5–10 minutes):
 - **Backpressure / auto-scaling** (`make scenario-backpressure`): a continuous producer floods the queue; the runner monitors queue depth and spawns additional consumers until equilibrium.
@@ -118,6 +119,8 @@ Producer (local)  ──▶  SQS Queue  ──▶  Consumer (local)  ──▶  
 | `MESSAGE_SIDE_EFFECTS_TABLE` | *(optional)* | DynamoDB table name for side effects (simulates external service) |
 | `SIDE_EFFECT_DELAY_SECONDS` | `0.0` | Delay before side effect to simulate slow external service (for visibility timeout testing) |
 | `CRASH_AFTER_SIDE_EFFECT` | `0` | Crash after side effect but before marking complete (for testing idempotency) |
+| `SIDE_EFFECT_LOG_PATH` | *(empty)* | If set, append a payload field as a line to this file (used for FIFO ordering scenario) |
+| `SIDE_EFFECT_LOG_FIELD` | `sequence` | Payload field to append when `SIDE_EFFECT_LOG_PATH` is set |
 | `BUSINESS_IDEMPOTENCY_FIELD` | *(empty)* | Payload field name to dedupe external side effects (e.g., `order_id`) |
 | `LOG_LEVEL` | `INFO` | Logging level (DEBUG, INFO, WARNING, ERROR) |
 
@@ -170,6 +173,7 @@ Each message contains a JSON payload with a UUID `id` and a random `work` value 
   make scenario-happy
   make scenario-crash
   make scenario-business-idempotency
+  make scenario-fifo-order
   ```
 - Pass extra arguments via `ARGS`:
   ```bash

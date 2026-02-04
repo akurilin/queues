@@ -35,6 +35,7 @@ SCENARIO_TF_KEYS = {
     "backpressure": "backpressure",
     "graceful-shutdown": "dup",  # reuses dup infrastructure (has DynamoDB + short visibility)
     "purge-timing": "happy",  # reuses happy infrastructure (just needs a queue)
+    "fifo-order": "fifo_order",
 }
 
 
@@ -1280,6 +1281,88 @@ def scenario_graceful_shutdown(args: argparse.Namespace, outputs: Dict) -> None:
     )
 
 
+def scenario_fifo_order(args: argparse.Namespace, outputs: Dict) -> None:
+    """Scenario: FIFO ordering with a single message group."""
+    queue_url = outputs["queue_url"]
+    region = outputs["aws_region"]
+    profile = os.environ.get("AWS_PROFILE", "")
+    dlq_url = queue_url_from_arn(outputs["dlq_arn"])
+    sqs = build_sqs_client(region, profile)
+    dynamo = build_dynamo_resource(region, profile)
+    cleanup_scenario_state(sqs, dynamo, outputs, "fifo-order")
+
+    attrs = sqs.get_queue_attributes(QueueUrl=queue_url, AttributeNames=["FifoQueue"])[
+        "Attributes"
+    ]
+    if attrs.get("FifoQueue") != "true":
+        raise RuntimeError("[fifo-order] Queue is not FIFO; check terraform config")
+
+    message_count = args.count
+    group_id = args.group_id
+    log_path = args.log_path
+
+    if os.path.exists(log_path):
+        os.remove(log_path)
+
+    consumer_env = {
+        "QUEUE_URL": queue_url,
+        "AWS_REGION": region,
+        "MESSAGE_LIMIT": str(message_count),
+        "IDLE_TIMEOUT_SECONDS": str(args.idle_timeout),
+        "LOG_LEVEL": "INFO",
+        "MAX_MESSAGES": "1",
+        "WAIT_TIME_SECONDS": "1",
+        "SIDE_EFFECT_LOG_PATH": log_path,
+        "SIDE_EFFECT_LOG_FIELD": "sequence",
+    }
+
+    print(f"[fifo-order] Starting {args.consumer_count} consumers ...")
+    procs = []
+    for _ in range(args.consumer_count):
+        procs.append(run_local_consumer_async(consumer_env, quiet=True))
+    time.sleep(args.consumer_start_delay)
+
+    print(f"[fifo-order] Sending {message_count} FIFO messages (group={group_id}) ...")
+    entries = []
+    for i in range(1, message_count + 1):
+        payload = {"id": f"seq-{i}", "sequence": i}
+        entries.append(
+            {
+                "Id": str(i),
+                "MessageBody": json.dumps(payload),
+                "MessageGroupId": group_id,
+                "MessageDeduplicationId": f"{group_id}-{i}-{uuid.uuid4()}",
+            }
+        )
+    for start in range(0, len(entries), 10):
+        sqs.send_message_batch(QueueUrl=queue_url, Entries=entries[start : start + 10])
+
+    wait_for_messages_enqueued(sqs, queue_url, message_count)
+
+    for proc in procs:
+        proc.wait(timeout=args.consumer_timeout)
+        if proc.returncode != 0:
+            raise RuntimeError(f"[fifo-order] Consumer failed with exit code {proc.returncode}")
+
+    print("[fifo-order] Waiting for queue to drain ...")
+    wait_for_queue_empty(sqs, queue_url, timeout=args.queue_timeout)
+    ensure_queue_empty(sqs, dlq_url, "DLQ")
+
+    if not os.path.exists(log_path):
+        raise RuntimeError(f"[fifo-order] Log file missing: {log_path}")
+    with open(log_path, "r", encoding="utf-8") as handle:
+        lines = [line.strip() for line in handle.readlines() if line.strip()]
+    try:
+        data = [int(line) for line in lines]
+    except ValueError as exc:
+        raise RuntimeError(f"[fifo-order] Log contains non-integer entries: {lines}") from exc
+    expected = list(range(1, message_count + 1))
+    if data != expected:
+        raise RuntimeError(f"[fifo-order] Log out of order: expected {expected}, got {data}")
+
+    print(f"[fifo-order] PASS | log={log_path} entries={len(data)}")
+
+
 def scenario_purge_timing(args: argparse.Namespace, outputs: Dict) -> None:
     """Scenario: SQS purge timing — verify our understanding of the 60-second
     purge window and its effects on message delivery.
@@ -1778,6 +1861,54 @@ def parse_args() -> argparse.Namespace:
         help="Idle timeout for consumer (should not be reached)",
     )
 
+    fifo = subparsers.add_parser(
+        "fifo-order",
+        help="FIFO ordering scenario (single message group with log verification)",
+    )
+    fifo.add_argument("--count", type=int, default=10, help="Messages to send")
+    fifo.add_argument(
+        "--group-id",
+        type=str,
+        default="tenant-1",
+        help="MessageGroupId to enforce FIFO ordering",
+    )
+    fifo.add_argument(
+        "--consumer-count",
+        type=int,
+        default=5,
+        help="Number of local consumers to run concurrently",
+    )
+    fifo.add_argument(
+        "--log-path",
+        type=str,
+        default="/tmp/fifo_output",
+        help="Path to log file used for ordering validation",
+    )
+    fifo.add_argument(
+        "--consumer-start-delay",
+        type=float,
+        default=1.0,
+        help="Seconds to wait after starting consumers before sending messages",
+    )
+    fifo.add_argument(
+        "--idle-timeout",
+        type=int,
+        default=10,
+        help="Idle timeout for consumers to exit when queue is empty",
+    )
+    fifo.add_argument(
+        "--consumer-timeout",
+        type=int,
+        default=60,
+        help="Timeout (seconds) to wait for each consumer process",
+    )
+    fifo.add_argument(
+        "--queue-timeout",
+        type=int,
+        default=120,
+        help="Timeout (seconds) to wait for queue to drain",
+    )
+
     pt = subparsers.add_parser(
         "purge-timing",
         help="SQS purge timing scenario (verify 60-second danger window behavior)",
@@ -1817,6 +1948,7 @@ def main() -> None:
         "side-effects": scenario_side_effects,
         "backpressure": scenario_backpressure,
         "graceful-shutdown": scenario_graceful_shutdown,
+        "fifo-order": scenario_fifo_order,
         "purge-timing": scenario_purge_timing,
     }.get(args.scenario)
 

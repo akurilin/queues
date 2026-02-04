@@ -8,6 +8,7 @@ locals {
     business = "${local.name}-business-idempotency"
     poison       = "${local.name}-poison"
     backpressure = "${local.name}-backpressure"
+    fifo_order  = "${local.name}-fifo-order"
   }
 
   env_file_path = "${path.module}/../.env"
@@ -22,9 +23,12 @@ module "sqs" {
   version  = "~> 4.2"
   for_each = local.scenarios
 
-  name = "${each.value}-queue"
+  name = each.key == "fifo_order" ? "${each.value}-queue.fifo" : "${each.value}-queue"
 
   create_dlq = true
+  fifo_queue = each.key == "fifo_order"
+  content_based_deduplication = each.key == "fifo_order"
+  dlq_name = each.key == "fifo_order" ? "${each.value}-dlq.fifo" : null
 
   visibility_timeout_seconds = var.queue_visibility_timeout
   receive_wait_time_seconds  = var.queue_receive_wait

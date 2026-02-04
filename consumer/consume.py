@@ -1,5 +1,6 @@
 """SQS consumer with configurable failure/sleep knobs for demo experiments."""
 
+import fcntl
 import hashlib
 import json
 import logging
@@ -82,6 +83,20 @@ def build_dynamo_resource(region: Optional[str]) -> Any:
 def now_iso() -> str:
     """UTC timestamp for table writes."""
     return datetime.utcnow().replace(tzinfo=timezone.utc).isoformat()
+
+
+def append_line(path: str, value: Any) -> None:
+    """Append a value to a text file (one line per entry) with a file lock."""
+    directory = os.path.dirname(path)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    with open(path, "a+", encoding="utf-8") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        handle.seek(0, os.SEEK_END)
+        handle.write(f"{value}\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+        fcntl.flock(handle, fcntl.LOCK_UN)
 
 
 def payload_digest(payload: Any) -> str:
@@ -314,6 +329,9 @@ def main() -> None:
     side_effect_delay = env_float("SIDE_EFFECT_DELAY_SECONDS", 0.0)
     # Optional business idempotency field (payload key to dedupe external side effects)
     business_idempotency_field = os.getenv("BUSINESS_IDEMPOTENCY_FIELD", "").strip()
+    # Optional JSON file to append side-effect values (used by FIFO ordering scenario)
+    side_effect_log_path = os.getenv("SIDE_EFFECT_LOG_PATH", "").strip()
+    side_effect_log_field = os.getenv("SIDE_EFFECT_LOG_FIELD", "sequence").strip()
 
     # Log startup configuration so user knows what behavior is enabled
     logger.info(
@@ -428,6 +446,8 @@ def main() -> None:
                         crash_after_side_effect,
                         side_effect_delay,
                         business_idempotency_field,
+                        side_effect_log_path,
+                        side_effect_log_field,
                     )
                     # Check if we've hit the optional message limit (for testing)
                     if message_limit and processed_count >= message_limit:
@@ -473,6 +493,8 @@ def handle_message(
     crash_after_side_effect: bool = False,
     side_effect_delay: float = 0.0,
     business_idempotency_field: str = "",
+    side_effect_log_path: str = "",
+    side_effect_log_field: str = "sequence",
 ) -> None:
     """Process a single message using the check-before-doing pattern.
 
@@ -574,6 +596,22 @@ def handle_message(
 
         # Step 5: Update our bookkeeping to record completion
         dynamo_tracker.mark_completed(message_id)
+
+    if side_effect_log_path and isinstance(payload, dict):
+        value = payload.get(side_effect_log_field)
+        if value is None:
+            logger.warning(
+                "Side effect log field %r missing in payload; skipping log",
+                side_effect_log_field,
+            )
+        else:
+            append_line(side_effect_log_path, value)
+            logger.info(
+                "Logged side effect to %s | field=%s value=%s",
+                side_effect_log_path,
+                side_effect_log_field,
+                value,
+            )
 
     # Step 6: Delete message from queue after successful processing
     delete_message(sqs_client, queue_url, message)

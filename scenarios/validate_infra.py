@@ -20,6 +20,7 @@ SCENARIO_TF_KEYS = {
     "duplicates": "dup",
     "business-idempotency": "business",
     "poison": "poison",
+    "fifo-order": "fifo_order",
 }
 
 
