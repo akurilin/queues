@@ -3,23 +3,28 @@
 Infrastructure + scenario runner showcasing happy paths and many failure modes of working with queues in distributed systems
 
 ## Scenarios
-`scenarios/` contains self-contained setups to exercise typical queue behaviors. Each scenario uses its own isolated SQS queue + DLQ and DynamoDB tables, all provisioned by the shared `terraform/` configuration. Consumers and producers run as local Python subprocesses.
+`scenarios/` contains self-contained setups to exercise typical queue behaviors. Each scenario lives in its own file under `scenarios/scenarios/{short,long}` and uses its own isolated SQS queue + DLQ and DynamoDB tables, all provisioned by the shared `terraform/` configuration. Consumers and producers run as local Python subprocesses.
+
+**Scenario naming conventions**
+- Scenario CLI name is derived from the filename (underscores become hyphens).
+- Terraform keys are used as the file stem when possible (e.g., `dup.py` for the duplicate-delivery scenario).
+- Scenarios that reuse another scenario’s infra prefix their file stem with that terraform key (e.g., `dup-side-effects.py` → CLI `dup-side-effects`).
 
 **Fast** (finish in seconds):
-- **Happy path** (`make scenario-happy`): messages flow through cleanly, all processed and deleted.
-- **Crash recovery** (`make scenario-crash`): consumer crashes after receiving; observe redelivery and recovery.
-- **Duplicate delivery** (`make scenario-duplicates`): slow processing triggers visibility timeout, causing redelivery; DynamoDB-backed idempotency prevents duplicate side effects.
-- **Business idempotency** (`make scenario-business-idempotency`): two different message IDs represent the same logical work; consumer dedupes on a business key (e.g., `order_id`).
-- **Poison messages** (`make scenario-poison`): messages with a poison marker are rejected and redrive to the DLQ after max retries.
-- **Partial batch failure** (`make scenario-partial-batch`): consumer receives batches of 10 messages containing both good and poison messages; good messages are processed and deleted individually while poison messages are retried and eventually land in the DLQ.
-- **External side effects** (`make scenario-side-effects`): consumer uses the check-before-doing pattern to handle external side effects; proves no duplicate side effects occur even when crashing after the side effect but before updating status.
-- **Graceful shutdown** (`make scenario-graceful-shutdown`): consumer receives SIGTERM mid-processing and finishes in-flight work before exiting cleanly.
-- **FIFO ordering** (`make scenario-fifo-order`): FIFO queue with a single message group verifies in-order delivery using a shared log file.
-- **Version ordering** (`make scenario-version-order`): standard queue + version checks apply only newer versions from out-of-order delivery.
+- **Happy path** (`happy`, `make scenario-happy`): messages flow through cleanly, all processed and deleted.
+- **Crash recovery** (`crash`, `make scenario-crash`): consumer crashes after receiving; observe redelivery and recovery.
+- **Duplicate delivery** (`dup`, `make scenario-dup`): slow processing triggers visibility timeout, causing redelivery; DynamoDB-backed idempotency prevents duplicate side effects.
+- **Business idempotency** (`business`, `make scenario-business`): two different message IDs represent the same logical work; consumer dedupes on a business key (e.g., `order_id`).
+- **Poison messages** (`poison`, `make scenario-poison`): messages with a poison marker are rejected and redrive to the DLQ after max retries.
+- **Partial batch failure** (`poison-partial-batch`, `make scenario-poison-partial-batch`): consumer receives batches of 10 messages containing both good and poison messages; good messages are processed and deleted individually while poison messages are retried and eventually land in the DLQ.
+- **External side effects** (`dup-side-effects`, `make scenario-dup-side-effects`): consumer uses the check-before-doing pattern to handle external side effects; proves no duplicate side effects occur even when crashing after the side effect but before updating status.
+- **Graceful shutdown** (`dup-graceful-shutdown`, `make scenario-dup-graceful-shutdown`): consumer receives SIGTERM mid-processing and finishes in-flight work before exiting cleanly.
+- **FIFO ordering** (`fifo-order`, `make scenario-fifo-order`): FIFO queue with a single message group verifies in-order delivery using a shared log file.
+- **Version ordering** (`version-order`, `make scenario-version-order`): standard queue + version checks apply only newer versions from out-of-order delivery.
 
 **Slow** (5–10 minutes):
-- **Backpressure / auto-scaling** (`make scenario-backpressure`): a continuous producer floods the queue; the runner monitors queue depth and spawns additional consumers until equilibrium.
-- **Purge timing** (`make scenario-purge-timing`): diagnostic scenario verifying SQS's 60-second async purge behavior and documenting the danger window for message loss.
+- **Backpressure / auto-scaling** (`backpressure`, `make scenario-backpressure`): a continuous producer floods the queue; the runner monitors queue depth and spawns additional consumers until equilibrium.
+- **Purge timing** (`happy-purge-timing`, `make scenario-happy-purge-timing`): diagnostic scenario verifying SQS's 60-second async purge behavior and documenting the danger window for message loss.
 
 **Not yet implemented:**
 - **Out-of-order processing**: demonstrate that standard SQS makes no ordering guarantees; show version/timestamp reconciliation for correct final state.
@@ -34,7 +39,7 @@ Infrastructure + scenario runner showcasing happy paths and many failure modes o
 | `producer/` | Local Python script to enqueue synthetic messages with batching and rate limiting |
 | `scripts/` | Build/push helper (`build_and_push.sh`), producer wrapper (`run_producer.sh`), env loader (`set_env.sh`) |
 | `terraform/` | Infrastructure definitions with local state |
-| `scenarios/` | Self-contained runnable scenarios exercising queue behaviors |
+| `scenarios/` | Scenario runner and modular scenario files |
 | `plans/` | Planning/design documents |
 
 ## Prerequisites
@@ -178,7 +183,7 @@ Each message contains a JSON payload with a UUID `id` and a random `work` value 
   ```bash
   make scenario-happy
   make scenario-crash
-  make scenario-business-idempotency
+  make scenario-business
   make scenario-fifo-order
   make scenario-version-order
   ```

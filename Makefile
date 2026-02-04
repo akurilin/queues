@@ -1,5 +1,5 @@
 .PHONY: help preflight infra-up infra-down infra-validate validate \
-       scenario-happy scenario-crash scenario-duplicates scenario-business-idempotency scenario-poison scenario-partial-batch scenario-side-effects scenario-graceful-shutdown scenario-fifo-order scenario-version-order scenario-purge-timing scenario-backpressure \
+       scenario-happy scenario-crash scenario-dup scenario-business scenario-poison scenario-poison-partial-batch scenario-dup-side-effects scenario-dup-graceful-shutdown scenario-fifo-order scenario-version-order scenario-happy-purge-timing scenario-backpressure \
        scenarios scenarios-fast scenarios-slow venv
 
 ARGS ?=
@@ -70,23 +70,23 @@ scenario-happy: $(VENV_STAMP) ## Run the happy-path scenario
 scenario-crash: $(VENV_STAMP) ## Run the crash scenario
 	$(VENV)/bin/python scenarios/run.py crash $(ARGS)
 
-scenario-duplicates: $(VENV_STAMP) ## Run the duplicates scenario
-	$(VENV)/bin/python scenarios/run.py duplicates $(ARGS)
+scenario-dup: $(VENV_STAMP) ## Run the duplicate delivery scenario
+	$(VENV)/bin/python scenarios/run.py dup $(ARGS)
 
-scenario-business-idempotency: $(VENV_STAMP) ## Run the business idempotency scenario
-	$(VENV)/bin/python scenarios/run.py business-idempotency $(ARGS)
+scenario-business: $(VENV_STAMP) ## Run the business idempotency scenario
+	$(VENV)/bin/python scenarios/run.py business $(ARGS)
 
 scenario-poison: $(VENV_STAMP) ## Run the poison message scenario
 	$(VENV)/bin/python scenarios/run.py poison $(ARGS)
 
-scenario-partial-batch: $(VENV_STAMP) ## Run the partial batch failure scenario
-	$(VENV)/bin/python scenarios/run.py partial-batch $(ARGS)
+scenario-poison-partial-batch: $(VENV_STAMP) ## Run the partial batch failure scenario
+	$(VENV)/bin/python scenarios/run.py poison-partial-batch $(ARGS)
 
-scenario-side-effects: $(VENV_STAMP) ## Run the transactional side effects scenario
-	$(VENV)/bin/python scenarios/run.py side-effects $(ARGS)
+scenario-dup-side-effects: $(VENV_STAMP) ## Run the transactional side effects scenario
+	$(VENV)/bin/python scenarios/run.py dup-side-effects $(ARGS)
 
-scenario-graceful-shutdown: $(VENV_STAMP) ## Run the graceful shutdown scenario
-	$(VENV)/bin/python scenarios/run.py graceful-shutdown $(ARGS)
+scenario-dup-graceful-shutdown: $(VENV_STAMP) ## Run the graceful shutdown scenario
+	$(VENV)/bin/python scenarios/run.py dup-graceful-shutdown $(ARGS)
 
 scenario-fifo-order: $(VENV_STAMP) ## Run the FIFO ordering scenario
 	$(VENV)/bin/python scenarios/run.py fifo-order $(ARGS)
@@ -94,17 +94,17 @@ scenario-fifo-order: $(VENV_STAMP) ## Run the FIFO ordering scenario
 scenario-version-order: $(VENV_STAMP) ## Run the versioning order scenario
 	$(VENV)/bin/python scenarios/run.py version-order $(ARGS)
 
-scenario-purge-timing: $(VENV_STAMP) ## Run the SQS purge timing scenario (~70s, tests 60s danger window)
-	$(VENV)/bin/python scenarios/run.py purge-timing $(ARGS)
+scenario-happy-purge-timing: $(VENV_STAMP) ## Run the SQS purge timing scenario (~70s, tests 60s danger window)
+	$(VENV)/bin/python scenarios/run.py happy-purge-timing $(ARGS)
 
-scenarios-fast: scenario-happy scenario-crash scenario-duplicates scenario-business-idempotency scenario-poison scenario-partial-batch scenario-side-effects scenario-graceful-shutdown scenario-fifo-order scenario-version-order ## Run fast scenarios only
+scenarios-fast: scenario-happy scenario-crash scenario-dup scenario-business scenario-poison scenario-poison-partial-batch scenario-dup-side-effects scenario-dup-graceful-shutdown scenario-fifo-order scenario-version-order ## Run fast scenarios only
 
 # --- Slow scenarios (minutes) ---
 
 scenario-backpressure: $(VENV_STAMP) ## Run the backpressure / scaling scenario (slow)
 	$(VENV)/bin/python scenarios/run.py backpressure $(ARGS)
 
-scenarios-slow: scenario-backpressure ## Run slow scenarios only
+scenarios-slow: scenario-backpressure scenario-happy-purge-timing ## Run slow scenarios only
 
 # --- All ---
 
