@@ -21,6 +21,7 @@ SCENARIO_TF_KEYS = {
     "business-idempotency": "business",
     "poison": "poison",
     "fifo-order": "fifo_order",
+    "version-order": "version_order",
 }
 
 

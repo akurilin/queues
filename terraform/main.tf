@@ -9,6 +9,7 @@ locals {
     poison       = "${local.name}-poison"
     backpressure = "${local.name}-backpressure"
     fifo_order  = "${local.name}-fifo-order"
+    version_order = "${local.name}-version-order"
   }
 
   env_file_path = "${path.module}/../.env"
