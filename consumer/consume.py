@@ -99,6 +99,41 @@ def append_line(path: str, value: Any) -> None:
         fcntl.flock(handle, fcntl.LOCK_UN)
 
 
+def apply_versioned_event(
+    state_path: str, entity_id: str, version: int, log_path: str
+) -> bool:
+    """Apply a versioned event if newer; return True if applied."""
+    directory = os.path.dirname(state_path)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    with open(state_path, "a+", encoding="utf-8") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        handle.seek(0)
+        raw = handle.read().strip()
+        if raw:
+            try:
+                state = json.loads(raw)
+            except json.JSONDecodeError:
+                state = {}
+        else:
+            state = {}
+        if not isinstance(state, dict):
+            state = {}
+        current = int(state.get(entity_id, 0))
+        if version <= current:
+            fcntl.flock(handle, fcntl.LOCK_UN)
+            return False
+        state[entity_id] = version
+        handle.seek(0)
+        handle.truncate()
+        handle.write(json.dumps(state))
+        handle.flush()
+        os.fsync(handle.fileno())
+        fcntl.flock(handle, fcntl.LOCK_UN)
+    append_line(log_path, version)
+    return True
+
+
 def payload_digest(payload: Any) -> str:
     """Deterministic digest for the payload to help with debugging/idempotency."""
     try:
@@ -332,6 +367,13 @@ def main() -> None:
     # Optional JSON file to append side-effect values (used by FIFO ordering scenario)
     side_effect_log_path = os.getenv("SIDE_EFFECT_LOG_PATH", "").strip()
     side_effect_log_field = os.getenv("SIDE_EFFECT_LOG_FIELD", "sequence").strip()
+    # Optional versioning mode for out-of-order scenario
+    versioning_enabled = bool(env_int("VERSIONING_ENABLED", 0))
+    version_state_path = os.getenv("VERSION_STATE_PATH", "").strip()
+    version_log_path = os.getenv("VERSION_LOG_PATH", "").strip()
+    version_seen_log_path = os.getenv("VERSION_SEEN_LOG_PATH", "").strip()
+    version_key = os.getenv("VERSION_KEY", "version").strip()
+    entity_key = os.getenv("ENTITY_KEY", "entity_id").strip()
 
     # Log startup configuration so user knows what behavior is enabled
     logger.info(
@@ -448,6 +490,12 @@ def main() -> None:
                         business_idempotency_field,
                         side_effect_log_path,
                         side_effect_log_field,
+                        versioning_enabled,
+                        version_state_path,
+                        version_log_path,
+                        version_seen_log_path,
+                        version_key,
+                        entity_key,
                     )
                     # Check if we've hit the optional message limit (for testing)
                     if message_limit and processed_count >= message_limit:
@@ -495,6 +543,12 @@ def handle_message(
     business_idempotency_field: str = "",
     side_effect_log_path: str = "",
     side_effect_log_field: str = "sequence",
+    versioning_enabled: bool = False,
+    version_state_path: str = "",
+    version_log_path: str = "",
+    version_seen_log_path: str = "",
+    version_key: str = "version",
+    entity_key: str = "entity_id",
 ) -> None:
     """Process a single message using the check-before-doing pattern.
 
@@ -550,6 +604,32 @@ def handle_message(
     # Reject poison messages (marker found in raw body)
     if reject_payload_marker and reject_payload_marker in body_raw:
         raise ValueError(f"Poison message rejected (marker={reject_payload_marker!r}, id={message_id})")
+
+    if versioning_enabled:
+        if not version_state_path or not version_log_path:
+            raise ValueError("VERSION_STATE_PATH and VERSION_LOG_PATH are required for versioning")
+        if not isinstance(payload, dict):
+            raise ValueError("Versioning requires JSON object payloads")
+        if entity_key not in payload or version_key not in payload:
+            raise ValueError(
+                f"Versioning payload missing {entity_key!r} or {version_key!r}"
+            )
+        entity_id = str(payload[entity_key])
+        try:
+            version_value = int(payload[version_key])
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"Invalid version value: {payload.get(version_key)!r}") from exc
+        if version_seen_log_path:
+            append_line(version_seen_log_path, version_value)
+        applied = apply_versioned_event(version_state_path, entity_id, version_value, version_log_path)
+        if applied:
+            logger.info("Applied versioned event | entity=%s version=%s", entity_id, version_value)
+        else:
+            logger.info("Skipped stale versioned event | entity=%s version=%s", entity_id, version_value)
+        delete_message(sqs_client, queue_url, message)
+        if message_id:
+            remember_message_id(message_id)
+        return
 
     # Check if this message has been processed before (in-memory idempotency check)
     if message_id and is_duplicate(message_id):
